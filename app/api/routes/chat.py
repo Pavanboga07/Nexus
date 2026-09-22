@@ -26,6 +26,8 @@ from app.llm.provider import (
     SYSTEM_PROMPT,
     MissingKeyError,
     OpenAICompatibleProvider,
+    ProviderRateLimitError,
+    ProviderTimeoutError,
     get_llm_config,
 )
 from app.tools.search_tools import WebFetchTool, WebSearchTool
@@ -113,6 +115,8 @@ async def _events(
         yield _sse(
             {"type": "error", "code": "MISSING_KEY", "message": str(exc)}
         )
+    except (ProviderTimeoutError, ProviderRateLimitError) as exc:
+        yield _sse({"type": "error", "code": exc.code, "message": str(exc)})
     except Exception as exc:  # noqa: BLE001 - SSE must stay well-formed
         yield _sse({"type": "error", "code": "STREAM_FAILED", "message": str(exc)})
     finally:

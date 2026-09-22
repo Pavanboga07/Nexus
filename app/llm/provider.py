@@ -13,10 +13,20 @@ failure and suggests retrying/rephrasing — never a dead-end fallback.
 Quarantine: retrieved content is untrusted data. The system prompt says
 so, tool outputs are wrapped in ``<retrieved>`` delimiters (with
 breakout escaping) before the model sees them.
+
+Provider quirks hardened (V7 shape-contracts, see tests/test_providers.py):
+nameless tool calls are dropped, missing call ids are synthesized,
+``extra_content``/thought-signature blobs are passed through verbatim
+into history (some providers reject follow-ups without them), provider
+``refusal`` text is surfaced as answer text, transport timeouts and HTTP
+429s surface as typed errors (``PROVIDER_TIMEOUT`` /
+``PROVIDER_RATE_LIMITED``), and ``tools``/``tool_choice`` ride only when
+tool schemas exist (some gateways reject empty ``tools: []``).
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import uuid
@@ -50,6 +60,41 @@ class MissingKeyError(RuntimeError):
     """Model key is not configured (code ``MISSING_KEY``)."""
 
     code = "MISSING_KEY"
+
+
+class ProviderTimeoutError(RuntimeError):
+    """Provider call timed out (code ``PROVIDER_TIMEOUT``). Retryable."""
+
+    code = "PROVIDER_TIMEOUT"
+
+
+class ProviderRateLimitError(RuntimeError):
+    """Provider returned HTTP 429 (code ``PROVIDER_RATE_LIMITED``). Retryable."""
+
+    code = "PROVIDER_RATE_LIMITED"
+
+
+def _classify_stream_error(exc: Exception) -> Exception:
+    """Map transport faults to typed provider errors; pass others through."""
+    if isinstance(exc, (ProviderTimeoutError, ProviderRateLimitError)):
+        return exc
+    if isinstance(exc, httpx.TimeoutException) or isinstance(
+        exc, (asyncio.TimeoutError, TimeoutError)
+    ):
+        return ProviderTimeoutError(
+            f"PROVIDER_TIMEOUT: the model request timed out ({exc}). "
+            "Retry the question."
+        )
+    if (
+        isinstance(exc, httpx.HTTPStatusError)
+        and exc.response is not None
+        and exc.response.status_code == 429
+    ):
+        return ProviderRateLimitError(
+            "PROVIDER_RATE_LIMITED: the model provider is rate-limiting "
+            "requests (HTTP 429). Wait a moment and retry."
+        )
+    return exc
 
 
 @dataclass
@@ -180,18 +225,27 @@ def _normalize_executor_result(
     return str(result), False
 
 
-def _parse_tool_call(tc: Any) -> tuple[str, str, dict[str, Any]]:
-    """Return (call_id, function name, parsed arguments) for one call."""
+def _parse_tool_call(tc: Any) -> tuple[str, str, dict[str, Any], Any]:
+    """Return (call_id, function name, parsed arguments, extra blob).
+
+    The extra blob is an opaque ``extra_content``/thought-signature value
+    carried for verbatim echo into history; it is never interpreted.
+    """
+    extra: Any = None
     if isinstance(tc, dict):
         fn = tc.get("function", {}) or {}
         call_id = str(tc.get("id") or "")
         name = str(fn.get("name") or "")
         raw_args = fn.get("arguments", {})
+        extra = tc.get("extra_content")
+        if extra is None:
+            extra = fn.get("extra_content")
     else:
         fn = getattr(tc, "function", None)
         call_id = str(getattr(tc, "id", "") or "")
         name = str(getattr(fn, "name", "") or "") if fn is not None else ""
         raw_args = getattr(fn, "arguments", {}) if fn is not None else {}
+        extra = getattr(tc, "extra_content", None)
     if isinstance(raw_args, str):
         try:
             parsed = json.loads(raw_args) if raw_args.strip() else {}
@@ -203,7 +257,22 @@ def _parse_tool_call(tc: Any) -> tuple[str, str, dict[str, Any]]:
         parsed = {}
     if not call_id:
         call_id = f"call_{uuid.uuid4().hex[:12]}"
-    return call_id, name, parsed
+    return call_id, name, parsed, extra
+
+
+def _merge_extras(blobs: list[Any]) -> Any:
+    """Combine opaque passthrough blobs: single as-is, dicts merged."""
+    live = [b for b in blobs if b]
+    if not live:
+        return None
+    if len(live) == 1:
+        return live[0]
+    if all(isinstance(b, dict) for b in live):
+        merged: dict[Any, Any] = {}
+        for blob in live:
+            merged.update(blob)
+        return merged
+    return live[-1]
 # SECTION: provider
 # A streamed chunk from the model: optional content delta plus optional
 # tool calls in the OpenAI ``tool_calls`` shape.
@@ -257,53 +326,73 @@ class OpenAICompatibleProvider:
         self, payload: dict[str, Any]
     ) -> AsyncIterator[Chunk]:
         body = dict(payload, stream=True, stream_options={"include_usage": False})
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            async with client.stream(
-                "POST",
-                f"{self._base_url}/chat/completions",
-                headers=self._headers(),
-                json=body,
-            ) as response:
-                response.raise_for_status()
-                async for line in response.aiter_lines():
-                    line = line.strip()
-                    if not line.startswith("data:"):
-                        continue
-                    data = line[5:].strip()
-                    if data == "[DONE]":
-                        return
-                    try:
-                        event = json.loads(data)
-                    except json.JSONDecodeError:
-                        continue
-                    chunk = self._chunk_from_event(event)
-                    if chunk.get("content") or chunk.get("tool_calls"):
-                        yield chunk
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                async with client.stream(
+                    "POST",
+                    f"{self._base_url}/chat/completions",
+                    headers=self._headers(),
+                    json=body,
+                ) as response:
+                    response.raise_for_status()
+                    async for line in response.aiter_lines():
+                        line = line.strip()
+                        if not line.startswith("data:"):
+                            continue
+                        data = line[5:].strip()
+                        if data == "[DONE]":
+                            return
+                        try:
+                            event = json.loads(data)
+                        except json.JSONDecodeError:
+                            continue
+                        chunk = self._chunk_from_event(event)
+                        if (
+                            chunk.get("content")
+                            or chunk.get("tool_calls")
+                            or chunk.get("extra_content")
+                        ):
+                            yield chunk
+        except Exception as exc:
+            raise _classify_stream_error(exc) from exc
 
     @staticmethod
     def _chunk_from_event(event: dict[str, Any]) -> Chunk:
-        """Normalize one provider SSE event into a Chunk."""
+        """Normalize one provider SSE event into a Chunk.
+
+        Provider ``refusal`` text is surfaced as content (never dropped);
+        opaque ``extra_content`` blobs ride through verbatim at both the
+        message level and the per-tool-call level.
+        """
         try:
             delta = event["choices"][0].get("delta", {}) or {}
         except (KeyError, IndexError, AttributeError):
             return {}
         content = delta.get("content") or ""
+        refusal = delta.get("refusal") or ""
+        text = f"{content}{refusal}"
         calls = []
         for tc in delta.get("tool_calls") or []:
             fn = tc.get("function", {}) or {}
-            calls.append(
-                {
-                    "index": tc.get("index", 0),
-                    "id": tc.get("id") or "",
-                    "name": fn.get("name") or "",
-                    "arguments": fn.get("arguments") or "",
-                }
-            )
+            entry: Chunk = {
+                "index": tc.get("index", 0),
+                "id": tc.get("id") or "",
+                "name": fn.get("name") or "",
+                "arguments": fn.get("arguments") or "",
+            }
+            blob = tc.get("extra_content")
+            if blob is None:
+                blob = fn.get("extra_content")
+            if blob:
+                entry["extra_content"] = blob
+            calls.append(entry)
         chunk: Chunk = {}
-        if content:
-            chunk["content"] = content
+        if text:
+            chunk["content"] = text
         if calls:
             chunk["tool_calls"] = calls
+        if delta.get("extra_content"):
+            chunk["extra_content"] = delta["extra_content"]
         return chunk
 
     async def generate_with_tools(
@@ -341,25 +430,35 @@ class OpenAICompatibleProvider:
         tool_texts: list[str] = []
         last_query = ""
         for _ in range(MAX_TOOL_ROUNDS):
-            payload = {
+            payload: dict[str, Any] = {
                 "model": self._model,
                 "messages": history,
-                "tools": tool_schemas,
             }
+            if tool_schemas:
+                # Gateways have rejected empty tools arrays / stray
+                # tool_choice, so both ride only when schemas exist.
+                payload["tools"] = tool_schemas
+                payload["tool_choice"] = "auto"
             content_parts: list[str] = []
-            pending: dict[int, dict[str, str]] = {}
+            pending: dict[int, dict[str, Any]] = {}
+            round_extras: list[Any] = []
             stream = self._post_stream_fn(payload)
             if hasattr(stream, "__aiter__"):
                 chunk_iter = stream.__aiter__()
             else:  # pragma: no cover - defensive (awaitable stream)
                 chunk_iter = (await stream).__aiter__()
-            async for chunk in chunk_iter:
-                delta = chunk.get("content") or ""
-                if delta:
-                    content_parts.append(str(delta))
-                    yield {"type": "token", "text": str(delta)}
-                for tc in chunk.get("tool_calls") or []:
-                    self._accumulate(pending, tc)
+            try:
+                async for chunk in chunk_iter:
+                    delta = chunk.get("content") or ""
+                    if delta:
+                        content_parts.append(str(delta))
+                        yield {"type": "token", "text": str(delta)}
+                    if chunk.get("extra_content"):
+                        round_extras.append(chunk["extra_content"])
+                    for tc in chunk.get("tool_calls") or []:
+                        self._accumulate(pending, tc)
+            except Exception as exc:
+                raise _classify_stream_error(exc) from exc
             raw_calls = [
                 {
                     "id": slot["id"],
@@ -367,12 +466,13 @@ class OpenAICompatibleProvider:
                         "name": slot["name"],
                         "arguments": slot["arguments"],
                     },
+                    "extra_content": slot["extra_content"],
                 }
                 for slot in pending.values()
             ]
             valid_calls = [
-                (call_id, name, args)
-                for call_id, name, args in (
+                (call_id, name, args, extra)
+                for call_id, name, args, extra in (
                     _parse_tool_call(tc) for tc in raw_calls
                 )
                 if name
@@ -387,18 +487,26 @@ class OpenAICompatibleProvider:
                     }
                     return
                 break
-            assistant_calls = [
-                {
+            assistant_calls = []
+            for call_id, name, args, extra in valid_calls:
+                entry: dict[str, Any] = {
                     "id": call_id,
                     "type": "function",
                     "function": {"name": name, "arguments": json.dumps(args)},
                 }
-                for call_id, name, args in valid_calls
-            ]
-            history.append(
-                {"role": "assistant", "content": None, "tool_calls": assistant_calls}
-            )
-            for call_id, name, args in valid_calls:
+                if extra:
+                    entry["extra_content"] = extra
+                assistant_calls.append(entry)
+            assistant_msg: dict[str, Any] = {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": assistant_calls,
+            }
+            merged_extra = _merge_extras(round_extras)
+            if merged_extra:
+                assistant_msg["extra_content"] = merged_extra
+            history.append(assistant_msg)
+            for call_id, name, args, _extra in valid_calls:
                 if name == "web_search" and isinstance(args.get("query"), str):
                     last_query = args["query"]
                 yield {
@@ -446,12 +554,13 @@ class OpenAICompatibleProvider:
             yield {"type": "done", "text": "", "citations": []}
 
     @staticmethod
-    def _accumulate(pending: dict[int, dict[str, str]], tc: Any) -> None:
+    def _accumulate(pending: dict[int, dict[str, Any]], tc: Any) -> None:
         """Merge one tool-call fragment into its per-index slot.
 
         Live providers stream arguments as string pieces across chunks;
         concatenation restores the full JSON before parsing. First
-        non-empty id/name wins; dict arguments replace.
+        non-empty id/name wins; dict arguments replace. Opaque
+        ``extra_content`` blobs are preserved first-wins for echo-back.
         """
         norm = OpenAICompatibleProvider._coalesce_call(tc)
         fn = norm.get("function", {}) or {}
@@ -459,7 +568,9 @@ class OpenAICompatibleProvider:
             idx = int(norm.get("index", len(pending)))
         except (TypeError, ValueError):
             idx = len(pending)
-        slot = pending.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+        slot = pending.setdefault(
+            idx, {"id": "", "name": "", "arguments": "", "extra_content": None}
+        )
         if not slot["id"] and norm.get("id"):
             slot["id"] = str(norm["id"])
         if not slot["name"] and fn.get("name"):
@@ -469,6 +580,11 @@ class OpenAICompatibleProvider:
             slot["arguments"] = json.dumps(args)
         elif isinstance(args, str) and args:
             slot["arguments"] += args
+        blob = norm.get("extra_content")
+        if blob is None:
+            blob = fn.get("extra_content")
+        if slot["extra_content"] is None and blob:
+            slot["extra_content"] = blob
 
     @staticmethod
     def _coalesce_call(tc: Any) -> dict[str, Any]:
@@ -480,10 +596,12 @@ class OpenAICompatibleProvider:
             }
             if "index" in tc:
                 out["index"] = tc["index"]
+            if tc.get("extra_content"):
+                out["extra_content"] = tc["extra_content"]
             return out
         if isinstance(tc, dict) and "name" in tc:
             # Streaming fragment shape {index, id, name, arguments(str)}.
-            return {
+            fragment: dict[str, Any] = {
                 "id": tc.get("id") or "",
                 "index": tc.get("index", 0),
                 "function": {
@@ -491,6 +609,9 @@ class OpenAICompatibleProvider:
                     "arguments": tc.get("arguments") or "",
                 },
             }
+            if tc.get("extra_content"):
+                fragment["extra_content"] = tc["extra_content"]
+            return fragment
         return tc if isinstance(tc, dict) else {}
 
 
@@ -500,6 +621,8 @@ __all__ = [
     "SYSTEM_PROMPT",
     "MissingKeyError",
     "OpenAICompatibleProvider",
+    "ProviderRateLimitError",
+    "ProviderTimeoutError",
     "build_digest",
     "escape_retrieved",
     "extract_citations",
