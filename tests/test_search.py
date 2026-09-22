@@ -154,6 +154,89 @@ def test_fetch_truncates_oversized_body():
     assert len(page.text.encode("utf-8")) <= MAX_BYTES
 
 
+def test_fetch_large_streaming_body_caps_without_buffering_all():
+    """DoS proof: huge chunked body returns <=8KB without waiting for all.
+
+    Loopback server sends PREFIX (>8KB) immediately, sleeps, then sends
+    ~2MB more with no Content-Length (forces the streaming path). A
+    buffering fetch must wait out the delay + full tail; a true
+    streaming fetch returns after the cap without waiting. Wide timing
+    margin keeps it deterministic (no pytest-timeout needed).
+    """
+    import asyncio
+    import time
+
+    from app.search.fetch import MAX_BYTES, fetch_url
+
+    HEAD = b"<html><head><title>Big</title></head><body><p>"
+    PREFIX = HEAD + b"y" * MAX_BYTES + b"</p>"
+    TAIL_BYTES = 2 * 1024 * 1024
+    TAIL_CHUNK = b"z" * 65536
+    DELAY = 3.0
+    BUDGET = 2.0
+
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        try:
+            data = b""
+            while b"\r\n\r\n" not in data:
+                chunk = await asyncio.wait_for(reader.read(4096), timeout=5)
+                if not chunk:
+                    break
+                data += chunk
+                if len(data) > 65536:
+                    break
+            writer.write(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n"
+                b"Connection: close\r\n\r\n"
+            )
+            writer.write(PREFIX)
+            await writer.drain()
+            await asyncio.sleep(DELAY)
+            remaining = TAIL_BYTES
+            while remaining > 0:
+                piece = TAIL_CHUNK[: min(len(TAIL_CHUNK), remaining)]
+                writer.write(piece)
+                remaining -= len(piece)
+                await writer.drain()
+            writer.write(b"</body></html>")
+            await writer.drain()
+        except (ConnectionResetError, BrokenPipeError, asyncio.CancelledError):
+            pass
+        except (asyncio.TimeoutError, TimeoutError):
+            pass
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    async def main():
+        server = await asyncio.start_server(handle, "127.0.0.1", 0)
+        try:
+            port = server.sockets[0].getsockname()[1]
+            assert port not in (8000, 3000)
+            start = time.monotonic()
+            page = await asyncio.wait_for(
+                fetch_url(f"http://127.0.0.1:{port}/large", allow_local=True),
+                timeout=10,
+            )
+            elapsed = time.monotonic() - start
+            return page, elapsed
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    page, elapsed = run(main())
+    assert page.title == "Big"
+    assert len(page.text.encode("utf-8")) <= MAX_BYTES
+    # Buffering impl waits out DELAY + full tail (>= DELAY); streaming
+    # impl returns after the cap without waiting.
+    assert elapsed < BUDGET, f"fetch took {elapsed:.2f}s (budget {BUDGET}s)"
+
+
 def test_fetch_strips_boilerplate():
     from app.search.fetch import fetch_url
 

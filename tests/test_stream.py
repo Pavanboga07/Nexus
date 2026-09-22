@@ -45,33 +45,66 @@ def make_provider(**kwargs):
 
 # SECTION: streaming
 def test_first_token_streams_before_completion():
-    """First chunk is yielded while the scripted source still has more."""
-    state = {"exhausted": False}
+    """Rendezvous proof: first token arrives while the source is blocked.
+
+    The scripted source yields chunk 1 then blocks on ``release`` before
+    chunk 2. The consumer signals ``first_seen`` on the first ``token``
+    event. A true streaming pipeline delivers the first token while the
+    source is still blocked; a buffering pipeline would deadlock (source
+    waits for ``release``, consumer waits for completion) so the
+    ``wait_for`` below times out instead of hanging.
+    """
+    release = asyncio.Event()
+    source_blocked = asyncio.Event()
+    source_finished = asyncio.Event()
+    first_seen = asyncio.Event()
 
     async def source(payload):
         yield {"content": "Hello "}
-        assert state["exhausted"] is False
+        source_blocked.set()
+        await release.wait()
         yield {"content": "world"}
-        state["exhausted"] = True
+        source_finished.set()
 
     provider = make_provider(post_stream_fn=source)
 
-    async def collect():
+    async def consume():
         events = []
         async for event in provider.stream_with_tools(
             [{"role": "user", "content": "hi"}], [], _null_executor
         ):
             events.append(event)
+            if event["type"] == "token" and not first_seen.is_set():
+                first_seen.set()
         return events
 
-    events = run(collect())
-    first = events[0]
-    assert first["type"] == "token"
-    assert first["text"] == "Hello "
-    # The first token arrived while the source was NOT exhausted.
-    assert state["exhausted"] is True  # source ran to completion after
-    assert events[-1]["type"] == "done"
-    assert events[-1]["text"] == "Hello world"
+    async def main():
+        task = asyncio.create_task(consume())
+        try:
+            # Fails (not hangs) on a buffering impl: the first token never
+            # arrives because the source stays blocked waiting for release.
+            await asyncio.wait_for(first_seen.wait(), timeout=5)
+            # First token arrived while the source was still blocked on
+            # chunk 2 -- only possible with true streaming.
+            assert source_blocked.is_set()
+            assert not source_finished.is_set()
+            release.set()
+            events = await asyncio.wait_for(task, timeout=5)
+        finally:
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except BaseException:
+                    pass
+        first = events[0]
+        assert first["type"] == "token"
+        assert first["text"] == "Hello "
+        assert events[-1]["type"] == "done"
+        assert events[-1]["text"] == "Hello world"
+        return events
+
+    run(main())
 
 
 def round_source():

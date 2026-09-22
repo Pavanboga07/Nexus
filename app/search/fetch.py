@@ -135,7 +135,13 @@ class _TextParser(HTMLParser):
 async def fetch_url(
     url: str, *, allow_local: bool = False, client: httpx.AsyncClient | None = None
 ) -> FetchedPage:
-    """Fetch a page: SSRF-validated per hop, redirect-bounded, size-capped."""
+    """Fetch a page: SSRF-validated per hop, redirect-bounded, size-capped.
+
+    The body is a true capped stream: headers are inspected first
+    (Content-Length pre-check refuses to buffer a declared-huge body;
+    malformed/missing lengths fall through to the capped stream), then
+    at most MAX_BYTES are read via ``aiter_bytes`` before parsing.
+    """
     current_url = url
     redirects_followed = 0
     owned = client is None
@@ -146,42 +152,70 @@ async def fetch_url(
         while True:
             validate_url(current_url, allow_local=allow_local)
             try:
-                response = await active.get(
+                async with active.stream(
+                    "GET",
                     current_url,
                     headers={
                         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
                     },
-                )
+                ) as response:
+                    if response.status_code in _REDIRECT_STATUSES:
+                        location = response.headers.get("location")
+                        if not location:
+                            raise FetchError(
+                                f"Fetch failed with HTTP {response.status_code} "
+                                f"for {current_url!r}."
+                            )
+                        redirects_followed += 1
+                        if redirects_followed > MAX_REDIRECTS:
+                            raise FetchError(
+                                f"Fetch failed for {url!r} (too many redirects)."
+                            )
+                        current_url = urljoin(current_url, location)
+                        continue
+                    if response.status_code >= 400:
+                        raise FetchError(
+                            f"Fetch failed with HTTP {response.status_code} "
+                            f"for {current_url!r}."
+                        )
+                    declared = response.headers.get("content-length")
+                    if declared is not None:
+                        try:
+                            declared_len = int(str(declared).strip())
+                        except (ValueError, TypeError):
+                            declared_len = None  # malformed -> stream with cap
+                        else:
+                            if declared_len > MAX_BYTES:
+                                # Declared oversize: refuse to buffer the full
+                                # body. The capped stream below reads at most
+                                # MAX_BYTES then closes (truncation contract:
+                                # 8 KB is a snippet cap, not a reject limit,
+                                # so most real pages exceed it).
+                                pass
+                    buf = bytearray()
+                    async for chunk in response.aiter_bytes(chunk_size=4096):
+                        if not chunk:
+                            continue
+                        remaining = MAX_BYTES - len(buf)
+                        if remaining <= 0:
+                            break
+                        if len(chunk) > remaining:
+                            buf.extend(chunk[:remaining])
+                            break
+                        buf.extend(chunk)
+                        if len(buf) >= MAX_BYTES:
+                            break
+                    raw = bytes(buf[:MAX_BYTES])
+                    parser = _TextParser()
+                    parser.feed(raw.decode("utf-8", errors="replace"))
+                    parser.close()
+                    return FetchedPage(
+                        url=current_url, title=parser.title, text=parser.text
+                    )
             except httpx.HTTPError as exc:
                 raise FetchError(
                     f"Fetch failed for {url!r} ({type(exc).__name__})."
                 ) from exc
-            if response.status_code in _REDIRECT_STATUSES:
-                location = response.headers.get("location")
-                if not location:
-                    raise FetchError(
-                        f"Fetch failed with HTTP {response.status_code} "
-                        f"for {current_url!r}."
-                    )
-                redirects_followed += 1
-                if redirects_followed > MAX_REDIRECTS:
-                    raise FetchError(
-                        f"Fetch failed for {url!r} (too many redirects)."
-                    )
-                current_url = urljoin(current_url, location)
-                continue
-            if response.status_code >= 400:
-                raise FetchError(
-                    f"Fetch failed with HTTP {response.status_code} "
-                    f"for {current_url!r}."
-                )
-            raw = response.content[:MAX_BYTES]
-            parser = _TextParser()
-            parser.feed(raw.decode("utf-8", errors="replace"))
-            parser.close()
-            return FetchedPage(
-                url=current_url, title=parser.title, text=parser.text
-            )
     finally:
         if owned:
             await active.aclose()
