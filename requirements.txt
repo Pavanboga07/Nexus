@@ -7,3 +7,4 @@ cryptography==46.0.1
 sqlalchemy
 asyncpg
 alembic
+sqlite-vec==0.1.6

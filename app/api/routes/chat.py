@@ -99,10 +99,15 @@ async def _events(
         # reads by the owner's own agent need no peer approval.
         return await _execute(tools, name, args)
 
+    assistant_text = ""
     try:
         async for stream_event in provider.stream_with_tools(
             messages, tool_schemas(tools), executor
         ):
+            if stream_event.get("type") == "token":
+                assistant_text += stream_event.get("text", "")
+            elif stream_event.get("type") == "done" and not assistant_text:
+                assistant_text = stream_event.get("text", "") or ""
             yield _sse(stream_event)
     except MissingKeyError as exc:
         yield _sse(
@@ -110,6 +115,28 @@ async def _events(
         )
     except Exception as exc:  # noqa: BLE001 - SSE must stay well-formed
         yield _sse({"type": "error", "code": "STREAM_FAILED", "message": str(exc)})
+    finally:
+        _extract_after_turn(message, assistant_text)
+
+
+def _extract_after_turn(user_text: str, assistant_text: str) -> None:
+    """Fire-and-forget memory extraction; never breaks the chat turn."""
+    try:
+        import datetime
+        import os
+
+        from app.memory.extract import queue_extraction
+
+        queue_extraction(
+            os.environ.get("NEXUS_DB_PATH", "data/nexus.db"),
+            user_text=user_text,
+            assistant_text=assistant_text,
+            created_at=datetime.datetime.now(
+                datetime.timezone.utc
+            ).isoformat(),
+        )
+    except Exception:  # noqa: BLE001 - extraction must not break chat
+        pass
 
 
 @router.get("/stream")
