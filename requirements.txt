@@ -3,3 +3,4 @@ uvicorn
 pydantic
 httpx
 pytest
+cryptography==46.0.1
