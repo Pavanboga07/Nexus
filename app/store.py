@@ -37,12 +37,47 @@ CREATE TABLE IF NOT EXISTS pair_attempts (
     cooldown_until TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS paired_peers (
-    agent_id TEXT PRIMARY KEY,
-    public_key TEXT NOT NULL,
-    display_name TEXT NOT NULL,
-    fingerprint TEXT NOT NULL,
-    card_json TEXT NOT NULL,
-    paired_at TEXT NOT NULL
+     agent_id TEXT PRIMARY KEY,
+     public_key TEXT NOT NULL,
+     display_name TEXT NOT NULL,
+     fingerprint TEXT NOT NULL,
+     card_json TEXT NOT NULL,
+     paired_at TEXT NOT NULL
+)""",
+    """CREATE TABLE IF NOT EXISTS a2a_messages (
+     message_id TEXT PRIMARY KEY,
+     correlation_id TEXT NOT NULL,
+     sender TEXT NOT NULL,
+     recipient TEXT NOT NULL,
+     message_type TEXT NOT NULL,
+     envelope_json TEXT NOT NULL,
+     status TEXT NOT NULL DEFAULT 'stored',
+     created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_a2a_messages_corr
+    ON a2a_messages (correlation_id);
+CREATE TABLE IF NOT EXISTS a2a_approvals (
+     approval_id TEXT PRIMARY KEY,
+     message_id TEXT NOT NULL UNIQUE,
+     correlation_id TEXT NOT NULL,
+     requester TEXT NOT NULL,
+     action TEXT NOT NULL,
+     data_category TEXT NOT NULL,
+     purpose TEXT NOT NULL,
+     question TEXT NOT NULL DEFAULT '',
+     expires_at TEXT NOT NULL,
+     status TEXT NOT NULL DEFAULT 'pending',
+     decided_at TEXT NOT NULL DEFAULT '',
+     created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS policy_rules (
+     rule_id TEXT PRIMARY KEY,
+     peer TEXT NOT NULL DEFAULT '*',
+     data_category TEXT NOT NULL DEFAULT '*',
+     purpose TEXT NOT NULL DEFAULT '*',
+     action TEXT NOT NULL DEFAULT '*',
+     effect TEXT NOT NULL DEFAULT 'ALLOW',
+     created_at TEXT NOT NULL
 )""",
 ]
 
