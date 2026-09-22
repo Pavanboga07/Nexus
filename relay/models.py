@@ -12,6 +12,8 @@ redesign):
   which relay process saw it).
 - ``auth_challenges``: single-use 32-byte challenges (base64 PK).
 - ``rate_hits``: per-IP directory write attempts for rate limiting.
+- ``relay_invites``: single-use invite claims (token hash -> card).
+- ``invite_claim_attempts``: per-IP wrong-code attempts for cooldown.
 """
 
 from __future__ import annotations
@@ -112,19 +114,49 @@ class RateHit(Base):
     )
 
 
+class Invite(Base):
+    __tablename__ = "relay_invites"
+
+    token_hash: Mapped[str] = mapped_column(Text, primary_key=True)
+    agent_id: Mapped[str] = mapped_column(Text, nullable=False, index=True)
+    card: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    used: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+
+class ClaimAttempt(Base):
+    __tablename__ = "invite_claim_attempts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ip: Mapped[str] = mapped_column(Text, nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
 TABLE_NAMES = [
     "relay_messages",
     "agent_directory",
     "agent_presence",
     "auth_challenges",
     "rate_hits",
+    "relay_invites",
+    "invite_claim_attempts",
 ]
 
 __all__ = [
     "TABLE_NAMES",
     "Base",
     "Challenge",
+    "ClaimAttempt",
     "DirectoryEntry",
+    "Invite",
     "Presence",
     "RateHit",
     "RelayMessage",

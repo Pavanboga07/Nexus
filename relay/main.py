@@ -25,7 +25,7 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
-from relay import auth, directory, presence, queue
+from relay import auth, directory, invites, presence, queue
 from relay.db import (
     check_ready,
     init_schema,
@@ -182,6 +182,45 @@ def create_relay_app(
                 session, limit=limit, offset=offset
             )
         return {"total": total, "items": items}
+
+    @app.post("/invites")
+    async def create_invite(body: dict):
+        card = body.get("card") if isinstance(body, dict) else None
+        code = body.get("code") if isinstance(body, dict) else None
+        ttl = body.get("ttl_seconds", invites.INVITE_TTL_SECONDS)
+        try:
+            async with Session() as session:
+                expires_at = await invites.create_invite_entry(
+                    session, card, code, ttl_seconds=ttl
+                )
+                await session.commit()
+        except invites.InviteClaimError as exc:
+            log_event("invite_publish_rejected", code=exc.code)
+            return JSONResponse(
+                status_code=exc.status,
+                content={"detail": str(exc), "code": exc.code},
+            )
+        log_event("invite_published", agent_id=card.get("agent_id"))
+        return {
+            "agent_id": card.get("agent_id"),
+            "expires_at": expires_at.isoformat(),
+        }
+
+    @app.post("/invites/claim")
+    async def claim_invite(body: dict, request: Request):
+        code = body.get("code") if isinstance(body, dict) else None
+        ip = request.client.host if request.client else "unknown"
+        try:
+            async with Session() as session:
+                card = await invites.claim_invite_entry(session, code, ip)
+                await session.commit()
+        except invites.InviteClaimError as exc:
+            log_event("invite_claim_rejected", code=exc.code)
+            return JSONResponse(
+                status_code=exc.status,
+                content={"detail": str(exc), "code": exc.code},
+            )
+        return {"card": card}
 
     # --- websocket helpers ----------------------------------------------
 

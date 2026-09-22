@@ -22,6 +22,28 @@ MIGRATIONS: list[str] = [
     encrypted_private_key TEXT NOT NULL,
     created_at TEXT NOT NULL
 )""",
+    """CREATE TABLE IF NOT EXISTS invites (
+    code_hash TEXT PRIMARY KEY,
+    agent_id TEXT NOT NULL,
+    card_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    used INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS pair_attempts (
+    key TEXT PRIMARY KEY,
+    failures INTEGER NOT NULL DEFAULT 0,
+    last_failure TEXT NOT NULL DEFAULT '',
+    cooldown_until TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS paired_peers (
+    agent_id TEXT PRIMARY KEY,
+    public_key TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    card_json TEXT NOT NULL,
+    paired_at TEXT NOT NULL
+)""",
 ]
 
 
