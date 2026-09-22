@@ -17,7 +17,7 @@ import hashlib
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from relay.directory import verify_card
@@ -130,36 +130,56 @@ async def claim_invite_entry(
             404, "INVALID_CODE", "invite code not recognized."
         )
     token_hash = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
-    row = (
-        await session.execute(
-            select(Invite).where(Invite.token_hash == token_hash)
-        )
-    ).scalar_one_or_none()
-    if row is None:
-        session.add(ClaimAttempt(ip=ip))
-        await session.flush()
-        left = MAX_ATTEMPTS - await _recent_ip_attempts(session, ip)
-        raise InviteClaimError(
-            404, "INVALID_CODE",
-            f"invite code not recognized ({max(0, left)} of "
-            f"{MAX_ATTEMPTS} attempts left).",
-        )
-    if row.used:
-        raise InviteClaimError(
-            409, "ALREADY_CLAIMED", "invite already claimed."
-        )
-    expires = row.expires_at
-    if expires.tzinfo is None:
-        expires = expires.replace(tzinfo=timezone.utc)
-    if _utcnow() >= expires:
-        raise InviteClaimError(
-            410, "EXPIRED",
-            "invite expired; ask the inviter for a new code.",
-        )
-    row.used = True
-    row.attempts = int(row.attempts or 0) + 1
-    await session.flush()
-    return dict(row.card)
+    # Atomic consume: a single UPDATE that only matches a live, unclaimed
+    # row. Concurrent claims serialize on the row lock; exactly one sees
+    # a row back (correct under any isolation, no lock ordering concerns).
+    # A miss falls through to the shared read below, so the loser of a
+    # race lands on the existing ALREADY_CLAIMED path, not a copy of it.
+    while True:
+        now = _utcnow()
+        card = (
+            await session.execute(
+                update(Invite)
+                .where(
+                    Invite.token_hash == token_hash,
+                    Invite.used.is_(False),
+                    Invite.expires_at > now,
+                )
+                .values(used=True, attempts=Invite.attempts + 1)
+                .returning(Invite.card)
+            )
+        ).scalar_one_or_none()
+        if card is not None:
+            return dict(card)
+        row = (
+            await session.execute(
+                select(Invite).where(Invite.token_hash == token_hash)
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            session.add(ClaimAttempt(ip=ip))
+            await session.flush()
+            left = MAX_ATTEMPTS - await _recent_ip_attempts(session, ip)
+            raise InviteClaimError(
+                404, "INVALID_CODE",
+                f"invite code not recognized ({max(0, left)} of "
+                f"{MAX_ATTEMPTS} attempts left).",
+            )
+        if row.used:
+            raise InviteClaimError(
+                409, "ALREADY_CLAIMED", "invite already claimed."
+            )
+        expires = row.expires_at
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+        if now >= expires:
+            raise InviteClaimError(
+                410, "EXPIRED",
+                "invite expired; ask the inviter for a new code.",
+            )
+        # Live and unclaimed, yet the UPDATE missed: only a concurrent
+        # republish slipping between the two statements can do that —
+        # retry the atomic consume rather than double-consuming.
 
 
 __all__ = [

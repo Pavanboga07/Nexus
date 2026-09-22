@@ -415,3 +415,62 @@ def test_routes_approve_garbage_card_rejected(tmp_path, monkeypatch):
     resp = client.post("/pairing/approve", json={"card": {"agent_id": "x"}})
     assert resp.status_code in (400, 401)
 
+
+def test_concurrent_claim_single_winner(relay_engine, tmp_path):
+    """Race: two simultaneous claims on one code -> exactly one wins.
+
+    Real concurrency (asyncio.gather, separate sessions against the test
+    PG DB, no mocks). Single-use code: loser must see ALREADY_CLAIMED.
+    """
+    import asyncio
+
+    from sqlalchemy import text
+    from relay import invites
+    from relay.db import make_session_factory
+    from tests import relay_db
+
+    from app import pairing
+
+    conn_a, ident_a = make_profile(tmp_path, "race")
+    priv_a, _, pub_a = profile_keypair(conn_a, "test-secret-race-xxxxxxxxxxxx")
+    card_a = live_card(priv_a, ident_a.agent_id, pub_a)
+    code = pairing.generate_code()
+
+    async def main():
+        Session = make_session_factory(relay_engine)
+        async with Session() as s:
+            await invites.create_invite_entry(s, card_a, code)
+            await s.commit()
+
+        # Pre-open both sessions so each holds a live pooled connection:
+        # without this the first claim can fully commit before the second
+        # connection finishes its handshake, hiding the race.
+        s1, s2 = Session(), Session()
+        try:
+            await s1.execute(text("SELECT 1"))
+            await s2.execute(text("SELECT 1"))
+
+            async def attempt(session, ip):
+                try:
+                    card = await invites.claim_invite_entry(session, code, ip)
+                    await session.commit()
+                    return ("ok", card["agent_id"])
+                except invites.InviteClaimError as exc:
+                    return ("err", exc.code, exc.status)
+
+            return await asyncio.gather(
+                attempt(s1, "10.9.0.1"), attempt(s2, "10.9.0.2")
+            )
+        finally:
+            await s1.close()
+            await s2.close()
+
+    res_a, res_b = relay_db.run(main())
+    wins = [r for r in (res_a, res_b) if r[0] == "ok"]
+    losses = [r for r in (res_a, res_b) if r[0] == "err"]
+    assert len(wins) == 1, f"expected exactly one winner, got: {res_a!r} {res_b!r}"
+    assert wins[0][1] == ident_a.agent_id
+    assert len(losses) == 1
+    assert losses[0][1] == "ALREADY_CLAIMED"
+    assert losses[0][2] == 409
+
