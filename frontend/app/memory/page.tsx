@@ -71,72 +71,132 @@ export default function MemoryPage() {
   );
 
   return (
-    <main>
-      <h1>Memory</h1>
-      <p>Long-term facts this laptop remembers. Forgetting deletes one for good.</p>
+    <main className="space-y-6">
+      <div className="space-y-1">
+        <h1 className="text-2xl font-semibold tracking-tight text-neutral-50">
+          Memory
+        </h1>
+        <p className="text-sm text-neutral-400">
+          Long-term facts this laptop remembers. Forgetting deletes one for
+          good.
+        </p>
+      </div>
 
       {status && (
-        <p role="status" aria-live="polite">
+        <p
+          role="status"
+          aria-live="polite"
+          className="rounded-lg border border-emerald-900 bg-emerald-950 px-3 py-2 text-sm text-emerald-200"
+        >
           {status}
         </p>
       )}
-      {error && <p role="alert">{error}</p>}
+      {error && (
+        <p
+          role="alert"
+          className="rounded-lg border border-red-900 bg-red-950 px-3 py-2 text-sm text-red-200"
+        >
+          {error}
+        </p>
+      )}
 
-      <section aria-labelledby="search-heading">
-        <h2 id="search-heading">Recall</h2>
+      <section
+        aria-labelledby="search-heading"
+        className="space-y-3 rounded-lg border border-neutral-800 bg-neutral-900 p-4 sm:p-5"
+      >
+        <h2
+          id="search-heading"
+          className="text-xs font-semibold uppercase tracking-widest text-neutral-500"
+        >
+          Recall
+        </h2>
         <form
           onSubmit={(e) => {
             e.preventDefault();
             void load(query.trim() || undefined);
           }}
+          className="flex flex-col gap-2 sm:flex-row sm:items-end"
         >
-          <label htmlFor="memory-search">Search memories</label>
-          <input
-            id="memory-search"
-            type="search"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="dog, standup, …"
-            disabled={loading}
-          />
-          <button type="submit" disabled={loading}>
-            {loading ? "Searching…" : "Search"}
-          </button>
-          <button
-            type="button"
-            disabled={loading || query.length === 0}
-            onClick={() => {
-              setQuery("");
-              void load();
-            }}
-          >
-            Clear
-          </button>
+          <div className="flex-1 space-y-1">
+            <label
+              htmlFor="memory-search"
+              className="block text-xs font-medium uppercase tracking-wide text-neutral-500"
+            >
+              Search memories
+            </label>
+            <input
+              id="memory-search"
+              type="search"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="dog, standup, …"
+              disabled={loading}
+              className="w-full rounded-md border border-neutral-700 bg-neutral-950 px-3 py-2 text-sm text-neutral-200 placeholder:text-neutral-600 focus:border-emerald-600 focus:outline-none focus:ring-2 focus:ring-emerald-600/40 disabled:cursor-not-allowed disabled:opacity-50"
+            />
+          </div>
+          <div className="flex gap-2">
+            <button
+              type="submit"
+              disabled={loading}
+              className="inline-flex items-center justify-center rounded-md bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-500 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/50 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {loading ? "Searching…" : "Search"}
+            </button>
+            <button
+              type="button"
+              disabled={loading || query.length === 0}
+              onClick={() => {
+                setQuery("");
+                void load();
+              }}
+              className="inline-flex items-center justify-center rounded-md border border-neutral-700 bg-neutral-950 px-4 py-2 text-sm font-medium text-neutral-300 hover:bg-neutral-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-neutral-500/50 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              Clear
+            </button>
+          </div>
         </form>
       </section>
 
-      <section aria-labelledby="list-heading">
-        <h2 id="list-heading">Stored facts</h2>
+      <section
+        aria-labelledby="list-heading"
+        className="space-y-3 rounded-lg border border-neutral-800 bg-neutral-900 p-4 sm:p-5"
+      >
+        <h2
+          id="list-heading"
+          className="text-xs font-semibold uppercase tracking-widest text-neutral-500"
+        >
+          Stored facts
+        </h2>
         {loading ? (
-          <p aria-live="polite">Loading…</p>
+          <p aria-live="polite" className="text-sm text-neutral-500">
+            Loading…
+          </p>
         ) : memories.length === 0 ? (
-          <p>Nothing remembered yet. Chat turns store facts here.</p>
+          <p className="text-sm text-neutral-500">
+            Nothing remembered yet. Chat turns store facts here.
+          </p>
         ) : (
-          <ul>
+          <ul className="space-y-2">
             {memories.map((m) => (
-              <li key={m.id}>
-                <p>{m.text}</p>
-                <p>
-                  <small>
+              <li
+                key={m.id}
+                className="flex flex-col gap-2 rounded-lg border border-neutral-800 bg-neutral-950 p-3 sm:flex-row sm:items-start sm:justify-between"
+              >
+                <div className="min-w-0 flex-1 space-y-1">
+                  <p className="text-sm leading-relaxed text-neutral-200">
+                    {m.text}
+                  </p>
+                  <p className="font-mono text-[11px] text-neutral-500">
                     {m.created_at || "undated"}
                     {m.session_id ? ` · ${m.session_id}` : ""}
-                  </small>
-                </p>
+                  </p>
+                </div>
                 <button
                   type="button"
                   onClick={() => forget(m.id)}
                   disabled={forgetting === m.id}
                   aria-label={`Forget: ${m.text.slice(0, 60)}`}
+                  className="inline-flex shrink-0 items-center justify-center rounded-md border border-red-800 bg-red-900/60 px-3 py-1.5 text-sm font-medium text-red-100 hover:bg-red-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-red-500/50 disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   {forgetting === m.id ? "Forgetting…" : "Forget"}
                 </button>
