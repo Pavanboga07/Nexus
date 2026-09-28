@@ -163,6 +163,7 @@ class MemoryStore:
         vec_k: int = VEC_K_DEFAULT,
         fts_k: int = FTS_K_DEFAULT,
         now: str | None = None,  # frozen clock hook for tests; ranking is time-free in v1
+        session_id: str | None = None,  # None = all sessions (browser); "" or an id scopes
     ) -> list[dict]:
         import sqlite_vec
 
@@ -170,20 +171,34 @@ class MemoryStore:
         qblob = sqlite_vec.serialize_float32(embed(query))
         vec_k = max(1, int(vec_k))
         fts_k = max(1, int(fts_k))
+        scope = (
+            " AND rowid IN (SELECT rowid FROM memories WHERE session_id = ?)"
+            if session_id is not None
+            else ""
+        )
+        vec_params: tuple = (
+            (qblob, session_id) if session_id is not None else (qblob,)
+        )
         vec_rows = self._conn.execute(
             "SELECT rowid, distance FROM memory_vec"
-            f" WHERE embedding MATCH ? AND k = {vec_k} ORDER BY distance",
-            (qblob,),
+            f" WHERE embedding MATCH ? AND k = {vec_k}{scope} ORDER BY distance",
+            vec_params,
         ).fetchall()
         vec_order = {r["rowid"]: r["distance"] for r in vec_rows}
         fts_rows: list = []
         match = _fts_query(query)
         if match is not None:
             try:
+                fts_params: tuple = (
+                    (match, session_id, fts_k)
+                    if session_id is not None
+                    else (match, fts_k)
+                )
                 fts_rows = self._conn.execute(
                     "SELECT rowid, rank FROM memory_fts"
-                    " WHERE memory_fts MATCH ? ORDER BY rank LIMIT ?",
-                    (match, fts_k),
+                    f" WHERE memory_fts MATCH ?{scope}"
+                    " ORDER BY rank LIMIT ?",
+                    fts_params,
                 ).fetchall()
             except sqlite3.OperationalError:
                 fts_rows = []

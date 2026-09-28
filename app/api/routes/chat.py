@@ -89,9 +89,10 @@ async def _events(
     message: str,
     provider: OpenAICompatibleProvider,
     tools: dict[str, Any],
+    session_id: str = "",
 ) -> AsyncIterator[str]:
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": _system_prompt(message, session_id)},
         {"role": "user", "content": message},
     ]
 
@@ -120,10 +121,37 @@ async def _events(
     except Exception as exc:  # noqa: BLE001 - SSE must stay well-formed
         yield _sse({"type": "error", "code": "STREAM_FAILED", "message": str(exc)})
     finally:
-        _extract_after_turn(message, assistant_text)
+        _extract_after_turn(message, assistant_text, session_id)
 
 
-def _extract_after_turn(user_text: str, assistant_text: str) -> None:
+def _system_prompt(message: str, session_id: str) -> str:
+    """System prompt with session-scoped recall injected (best-effort).
+
+    Memories stay scoped per session: only rows stored under this
+    ``session_id`` are injected. Recall never breaks the turn — any
+    failure falls back to the bare prompt.
+    """
+    try:
+        import os
+
+        from app.memory.store import MemoryStore
+
+        store = MemoryStore(os.environ.get("NEXUS_DB_PATH", "data/nexus.db"))
+        try:
+            hits = store.recall(message, limit=5, session_id=session_id)
+        finally:
+            store.close()
+    except Exception:  # noqa: BLE001 - recall must not break chat
+        return SYSTEM_PROMPT
+    if not hits:
+        return SYSTEM_PROMPT
+    lines = "\n".join(f"- {hit['text']}" for hit in hits)
+    return f"{SYSTEM_PROMPT}\n\nSession memories (use them when relevant):\n{lines}"
+
+
+def _extract_after_turn(
+    user_text: str, assistant_text: str, session_id: str = ""
+) -> None:
     """Fire-and-forget memory extraction; never breaks the chat turn."""
     try:
         import datetime
@@ -135,6 +163,7 @@ def _extract_after_turn(user_text: str, assistant_text: str) -> None:
             os.environ.get("NEXUS_DB_PATH", "data/nexus.db"),
             user_text=user_text,
             assistant_text=assistant_text,
+            session_id=session_id,
             created_at=datetime.datetime.now(
                 datetime.timezone.utc
             ).isoformat(),
@@ -144,7 +173,10 @@ def _extract_after_turn(user_text: str, assistant_text: str) -> None:
 
 
 @router.get("/stream")
-async def chat_stream(message: str = Query(min_length=1, max_length=4000)):
+async def chat_stream(
+    message: str = Query(min_length=1, max_length=4000),
+    session_id: str = Query(default="", max_length=200),
+):
     try:
         provider = build_provider()
     except MissingKeyError as exc:
@@ -154,7 +186,7 @@ async def chat_stream(message: str = Query(min_length=1, max_length=4000)):
         )
     tools = build_tools()
     return StreamingResponse(
-        _events(message, provider, tools),
+        _events(message, provider, tools, session_id),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

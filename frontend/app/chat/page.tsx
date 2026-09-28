@@ -194,6 +194,12 @@ export default function ChatPage() {
   const [citations, setCitations] = useState<string[]>([]);
   const [streaming, setStreaming] = useState(false);
   const [streamError, setStreamError] = useState<string | null>(null);
+  // One recall/extraction scope per page load: stream recall injects
+  // only this session's memories, and extraction records the same id.
+  const [sessionId] = useState(
+    () =>
+      `chat-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+  );
   const [live, setLive] = useState<"off" | "on" | "down">("off");
   const [toAnswer, setToAnswer] = useState<ToAnswer[]>([]);
   const [answerText, setAnswerText] = useState<Record<string, string>>({});
@@ -391,7 +397,7 @@ export default function ChatPage() {
     setCitations([]);
     try {
       const res = await fetch(
-        `${API_BASE}/chat/stream?message=${encodeURIComponent(prompt)}`,
+        `${API_BASE}/chat/stream?message=${encodeURIComponent(prompt)}&session_id=${encodeURIComponent(sessionId)}`,
         { headers: { Accept: "text/event-stream" } }
       );
       if (!res.ok || !res.body) {
@@ -461,7 +467,7 @@ export default function ChatPage() {
     } finally {
       setStreaming(false);
     }
-  }, [streamInput, streaming]);
+  }, [streamInput, streaming, sessionId]);
 
   // Display-only derived values for the conversational thread layout.
   const selectedPeer = peers.find((p) => p.agent_id === peerId) ?? null;
