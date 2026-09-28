@@ -36,6 +36,17 @@ type ChatMessage = {
   envelope: Record<string, unknown>;
 };
 
+type DeliveryStatus = {
+  mode: "relayed" | "local-only";
+  status?: string;
+  reason?: string;
+};
+
+type ToAnswer = {
+  correlation_id: string;
+  requester: string;
+};
+
 function ErrorState({ message }: { message: string }) {
   return (
     <p
@@ -183,6 +194,10 @@ export default function ChatPage() {
   const [citations, setCitations] = useState<string[]>([]);
   const [streaming, setStreaming] = useState(false);
   const [streamError, setStreamError] = useState<string | null>(null);
+  const [live, setLive] = useState<"off" | "on" | "down">("off");
+  const [toAnswer, setToAnswer] = useState<ToAnswer[]>([]);
+  const [answerText, setAnswerText] = useState<Record<string, string>>({});
+  const [answering, setAnswering] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -206,18 +221,67 @@ export default function ChatPage() {
     refresh();
   }, [refresh]);
 
+  // Live relay deliveries: the backend holds the signed relay socket
+  // (/ask/live bridges it); every delivery refreshes approvals/messages.
+  // Best-effort: manual refresh below always works when live is down.
+  useEffect(() => {
+    let closed = false;
+    let ws: WebSocket | null = null;
+    try {
+      ws = new WebSocket(`${API_BASE.replace(/^http/, "ws")}/ask/live`);
+    } catch {
+      setLive("down");
+      return () => {};
+    }
+    ws.onopen = () => {
+      if (!closed) setLive("on");
+    };
+    ws.onmessage = (event) => {
+      try {
+        const msg = JSON.parse(event.data as string) as { type?: string };
+        if (msg.type === "delivery") void refresh();
+      } catch {
+        /* ignore malformed frames */
+      }
+    };
+    const markDown = () => {
+      if (!closed) setLive("down");
+    };
+    ws.onerror = markDown;
+    ws.onclose = markDown;
+    return () => {
+      closed = true;
+      try {
+        ws?.close();
+      } catch {
+        /* teardown is best-effort */
+      }
+    };
+  }, [refresh]);
+
   const sendAsk = useCallback(async () => {
     if (!peerId || question.trim().length === 0) return;
     setAskBusy(true);
     setError(null);
     setStatus(null);
     try {
-      await api("/ask", {
+      const data = await api<{ delivery?: DeliveryStatus }>("/ask", {
         method: "POST",
         body: JSON.stringify({ peer_agent_id: peerId, question }),
       });
+      const delivery = data.delivery;
+      if (delivery?.mode === "relayed") {
+        setStatus(
+          `Question sent via relay (${delivery.status ?? "queued"}). The peer approves before answering.`
+        );
+      } else if (delivery?.mode === "local-only") {
+        setStatus(
+          `Relay unreachable (${delivery.reason ?? "unknown"}) — question stored locally only.`
+        );
+      } else {
+        setStatus("Question sent. The peer approves before answering.");
+      }
       setQuestion("");
-      setStatus("Question sent. The peer approves before answering.");
       await refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not send.");
@@ -231,12 +295,35 @@ export default function ChatPage() {
       setDeciding(approvalId);
       setError(null);
       try {
-        await api(`/ask/approvals/${approvalId}/${verdict}`, {
-          method: "POST",
-        });
-        setStatus(
-          verdict === "approve" ? "Approved. An answer can follow." : "Denied."
+        const card = cards.find((c) => c.approval_id === approvalId) ?? null;
+        const data = await api<{ delivery?: DeliveryStatus }>(
+          `/ask/approvals/${approvalId}/${verdict}`,
+          { method: "POST" }
         );
+        const via =
+          data.delivery?.mode === "relayed"
+            ? ` via relay (${data.delivery.status ?? "queued"})`
+            : data.delivery?.mode === "local-only"
+              ? " (relay unreachable — stored locally only)"
+              : "";
+        if (verdict === "approve") {
+          setStatus(`Approved${via}. An answer can follow.`);
+          if (card) {
+            setToAnswer((prev) =>
+              prev.some((t) => t.correlation_id === card.correlation_id)
+                ? prev
+                : [
+                    ...prev,
+                    {
+                      correlation_id: card.correlation_id,
+                      requester: card.requester,
+                    },
+                  ]
+            );
+          }
+        } else {
+          setStatus(`Denied${via}.`);
+        }
         await refresh();
       } catch (err) {
         setError(err instanceof Error ? err.message : "Decision failed.");
@@ -244,7 +331,54 @@ export default function ChatPage() {
         setDeciding(null);
       }
     },
-    [refresh]
+    [cards, refresh]
+  );
+
+  const sendAnswer = useCallback(
+    async (correlationId: string) => {
+      const target = toAnswer.find(
+        (t) => t.correlation_id === correlationId
+      );
+      const text = (answerText[correlationId] ?? "").trim();
+      if (!target || text.length === 0 || answering) return;
+      setAnswering(correlationId);
+      setError(null);
+      try {
+        const data = await api<{ delivery?: DeliveryStatus }>(
+          "/ask/response",
+          {
+            method: "POST",
+            body: JSON.stringify({
+              peer_agent_id: target.requester,
+              correlation_id: target.correlation_id,
+              answer: text,
+            }),
+          }
+        );
+        const delivery = data.delivery;
+        setStatus(
+          delivery?.mode === "relayed"
+            ? `Answer sent via relay (${delivery.status ?? "queued"}).`
+            : delivery?.mode === "local-only"
+              ? `Relay unreachable (${delivery.reason ?? "unknown"}) — answer stored locally only.`
+              : "Answer sent."
+        );
+        setToAnswer((prev) =>
+          prev.filter((t) => t.correlation_id !== correlationId)
+        );
+        setAnswerText((prev) => {
+          const next = { ...prev };
+          delete next[correlationId];
+          return next;
+        });
+        await refresh();
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "Could not send answer.");
+      } finally {
+        setAnswering(null);
+      }
+    },
+    [toAnswer, answerText, answering, refresh]
   );
 
   const runStream = useCallback(async () => {
@@ -402,6 +536,21 @@ export default function ChatPage() {
           }
         >
           {pendingCount} pending
+        </span>
+        <span
+          aria-label={live === "on" ? "Live relay updates on" : "Live relay updates off"}
+          title={
+            live === "on"
+              ? "Relay deliveries refresh this view live"
+              : "Live updates unavailable — approvals refresh on send/decide"
+          }
+          className={
+            live === "on"
+              ? "inline-flex items-center rounded-full border border-emerald-900 bg-emerald-950/40 px-2 py-0.5 text-xs font-medium text-emerald-300"
+              : "inline-flex items-center rounded-full border border-neutral-800 bg-neutral-950 px-2 py-0.5 text-xs text-neutral-500"
+          }
+        >
+          {live === "on" ? "live" : "live off"}
         </span>
       </header>
 
@@ -668,14 +817,72 @@ export default function ChatPage() {
         )}
       </section>
 
+      {toAnswer.length > 0 && (
+        <section
+          aria-labelledby="answer-heading"
+          className="space-y-3 rounded-lg border border-neutral-800 bg-neutral-900 p-3"
+        >
+          <h2
+            id="answer-heading"
+            className="text-xs font-semibold uppercase tracking-widest text-neutral-500"
+          >
+            Approved — send an answer
+          </h2>
+          <ul className="space-y-3">
+            {toAnswer.map((item) => (
+              <li
+                key={item.correlation_id}
+                className="space-y-2 rounded-lg border border-neutral-800 bg-neutral-950 p-3"
+              >
+                <p className="font-mono text-[11px] text-neutral-500">
+                  to {item.requester} · {item.correlation_id}
+                </p>
+                <label
+                  htmlFor={`answer-${item.correlation_id}`}
+                  className="sr-only"
+                >
+                  Answer
+                </label>
+                <textarea
+                  id={`answer-${item.correlation_id}`}
+                  value={answerText[item.correlation_id] ?? ""}
+                  onChange={(e) =>
+                    setAnswerText((prev) => ({
+                      ...prev,
+                      [item.correlation_id]: e.target.value,
+                    }))
+                  }
+                  placeholder="Type the answer…"
+                  rows={2}
+                  disabled={answering === item.correlation_id}
+                  className="w-full resize-none rounded-md border border-neutral-700 bg-neutral-950 px-3 py-2 text-sm text-neutral-200 placeholder:text-neutral-600 focus:border-emerald-600 focus:outline-none focus:ring-2 focus:ring-emerald-600/40 disabled:cursor-not-allowed disabled:opacity-50"
+                />
+                <button
+                  type="button"
+                  onClick={() => void sendAnswer(item.correlation_id)}
+                  disabled={
+                    answering === item.correlation_id ||
+                    (answerText[item.correlation_id] ?? "").trim().length === 0
+                  }
+                  className="inline-flex items-center justify-center rounded-md bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-500 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/50 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {answering === item.correlation_id
+                    ? "Sending…"
+                    : "Send answer"}
+                </button>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
       <section
         aria-labelledby="ask-heading"
         className="rounded-lg border border-neutral-800 bg-neutral-900 p-3"
       >
         <h2 id="ask-heading" className="sr-only">
           Ask
-        </h2>
-        {peers.length === 0 ? (
+        </h2>        {peers.length === 0 ? (
           <p className="text-sm text-neutral-500">
             No paired peers yet. Pair one first.
           </p>
