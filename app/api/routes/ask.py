@@ -22,6 +22,10 @@ from app.a2a.service import A2AError
 
 router = APIRouter(prefix="/ask", tags=["ask"])
 
+# Poll interval for the live-bridge pump watch (relay drop -> browser
+# teardown). Small so the UI flips to disconnected promptly.
+LIVE_PUMP_POLL_INTERVAL = 0.5
+
 
 class AskIn(BaseModel):
     peer_agent_id: str
@@ -145,6 +149,8 @@ def _relay_delivery(conn: sqlite3.Connection, envelope: dict) -> dict:
                 agent_id=agent_id,
                 public_key_b64=_local_pubkey(conn),
                 sign_fn=lambda data: crypto.sign_bytes(priv, data),
+                timeout=relay_client.CONNECT_TIMEOUT,
+                ack_timeout=relay_client.ACK_TIMEOUT,
             )
         )
         return {"mode": "relayed", "status": status}
@@ -403,14 +409,43 @@ async def live_bridge(browser: WebSocket):
     pump = asyncio.ensure_future(_pump_relay_deliveries(browser, relay_ws))
     try:
         while True:
-            await browser.receive_json()  # pings ignored; close raises
             if pump.done():
+                # Relay dropped: the pump already returned, so tell the
+                # UI and close — else the bridge sits in receive_json
+                # forever showing "on" with no reconnect.
+                try:
+                    await browser.send_json(
+                        {
+                            "type": "relay_down",
+                            "reason": (
+                                "relay unreachable: connection lost."
+                            ),
+                        }
+                    )
+                except Exception:  # noqa: BLE001 - browser went away
+                    pass
+                try:
+                    await browser.close(code=1011)
+                except Exception:  # noqa: BLE001 - close best-effort
+                    pass
                 break
+            try:
+                await asyncio.wait_for(
+                    browser.receive_json(),
+                    timeout=LIVE_PUMP_POLL_INTERVAL,
+                )  # pings ignored; close raises
+            except asyncio.TimeoutError:
+                continue
     except WebSocketDisconnect:
         pass
     finally:
         if not pump.done():
             pump.cancel()
+        else:
+            try:
+                pump.exception()
+            except Exception:  # noqa: BLE001 - pump outcome already handled
+                pass
         try:
             await relay_ws.close()
         except Exception:  # noqa: BLE001 - teardown is best-effort

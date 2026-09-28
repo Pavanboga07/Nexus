@@ -39,6 +39,12 @@ from typing import Any
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 WS_CLOSE_UNAUTHORIZED = 4401
 
+# Interactive delivery budgets (was: connect 10.0s, ack 20.0s — a down
+# relay stalled every /ask ~10-20s). Short so the HTTP path fails fast
+# to local-only; background callers use the same safe defaults.
+CONNECT_TIMEOUT = 3.0
+ACK_TIMEOUT = 5.0
+
 SignFn = Callable[[bytes], bytes | Awaitable[bytes]]
 
 
@@ -158,7 +164,7 @@ async def send_envelope(
     envelope: dict[str, Any],
     recipient: str,
     relay_id: str | None = None,
-    timeout: float = 20.0,
+    timeout: float = ACK_TIMEOUT,
 ) -> str:
     """Send one envelope; return the ``delivery_ack`` status.
 
@@ -303,7 +309,7 @@ class StdWs:
         return opcode, payload
 
 
-async def open_connection(url: str, *, timeout: float = 10.0) -> StdWs:
+async def open_connection(url: str, *, timeout: float = CONNECT_TIMEOUT) -> StdWs:
     """Open a ``ws(s)://`` URL and complete the HTTP upgrade (stdlib)."""
     parts = urllib.parse.urlsplit(url)
     if parts.scheme not in ("ws", "wss"):
@@ -388,7 +394,7 @@ async def connect(
     agent_id: str,
     public_key_b64: str,
     sign_fn: SignFn,
-    timeout: float = 10.0,
+    timeout: float = CONNECT_TIMEOUT,
 ) -> StdWs:
     """Open + authenticate one relay socket (closes it on auth failure)."""
     ws = await open_connection(url, timeout=timeout)
@@ -412,7 +418,8 @@ async def deliver_one(
     public_key_b64: str,
     sign_fn: SignFn,
     relay_id: str | None = None,
-    timeout: float = 10.0,
+    timeout: float = CONNECT_TIMEOUT,
+    ack_timeout: float = ACK_TIMEOUT,
 ) -> str:
     """Connect, send one envelope, return the ``delivery_ack`` status."""
     ws = await connect(
@@ -422,13 +429,15 @@ async def deliver_one(
     try:
         return await send_envelope(
             ws, envelope=envelope, recipient=recipient,
-            relay_id=relay_id, timeout=timeout + 10.0,
+            relay_id=relay_id, timeout=ack_timeout,
         )
     finally:
         await ws.close()
 
 
 __all__ = [
+    "ACK_TIMEOUT",
+    "CONNECT_TIMEOUT",
     "WS_CLOSE_UNAUTHORIZED",
     "ConnectionClosed",
     "RelayAuthError",

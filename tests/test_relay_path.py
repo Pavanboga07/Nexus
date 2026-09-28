@@ -651,3 +651,157 @@ def test_live_bridge_auth_failure_closes_4401(tmp_path, monkeypatch):
         with pytest.raises(WebSocketDisconnect) as exc:
             ws.receive_json()  # server sends nothing: auth failed, 4401
     assert exc.value.code == 4401
+
+
+def _free_refused_port():
+    """Ephemeral loopback port, closed so connects refuse (never 8000s)."""
+    import socket
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    assert port not in (8000, 3000, 8001, 3001)
+    return port
+
+
+def test_ask_falls_back_fast_when_relay_refused(tmp_path, monkeypatch):
+    """RELAY-DOWN HANG: refused relay -> fast local-only fallback (<8s).
+
+    Interactive timeouts stay aggressive (connect <=3s, ack wait <=5s)
+    via named constants; the status must name unreachability.
+    """
+    import time
+
+    from app.a2a import relay_client as rc
+
+    connect_timeout = getattr(rc, "CONNECT_TIMEOUT", getattr(
+        rc, "INTERACTIVE_CONNECT_TIMEOUT", None))
+    ack_timeout = getattr(rc, "ACK_TIMEOUT", getattr(
+        rc, "INTERACTIVE_ACK_TIMEOUT", None))
+    assert connect_timeout is not None, "named connect timeout constant"
+    assert ack_timeout is not None, "named ack timeout constant"
+    assert connect_timeout <= 3.0, connect_timeout
+    assert ack_timeout <= 5.0, ack_timeout
+
+    port = _free_refused_port()
+    client = _ask_client(
+        tmp_path, monkeypatch, name="fastfb",
+        relay_url=f"http://127.0.0.1:{port}",
+    )
+    peer_id = _route_peer(client)
+    started = time.monotonic()
+    resp = client.post(
+        "/ask", json={"peer_agent_id": peer_id, "question": "Summarize?"}
+    )
+    elapsed = time.monotonic() - started
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["delivery"]["mode"] == "local-only"
+    assert "unreachable" in str(
+        body["delivery"].get("reason", "")).lower()
+    assert elapsed < 8.0, elapsed
+
+
+def test_live_bridge_tears_down_when_relay_drops(tmp_path, monkeypatch):
+    """STALE LIVE BRIDGE: relay drop -> browser closes (or relay_down)."""
+    import threading
+
+    import app.api.routes.ask as ask_route
+    from app.a2a import envelope as app_envelope
+    from app.a2a import relay_client as rc
+    from app.identity.service import load_identity
+    from app.store import open_db
+    from starlette.websockets import WebSocketDisconnect
+    from tests.relay_db import new_agent
+
+    client = _live_client(tmp_path, monkeypatch, name="livedrop")
+    peer_priv, peer_pub, peer_id = new_agent()
+    assert client.post(
+        "/pairing/approve",
+        json={"card": live_card(peer_priv, peer_id, peer_pub, "Blaise")},
+    ).status_code == 200
+    conn = open_db(__import__("os").environ["NEXUS_DB_PATH"])
+    try:
+        local_id = load_identity(
+            conn, __import__("os").environ["NEXUS_IDENTITY_KEY"]
+        ).agent_id
+    finally:
+        conn.close()
+    env = app_envelope.sign(
+        app_envelope.new_envelope(
+            sender=peer_id, recipient=local_id, message_type="request",
+            payload={"action": "answer", "question": "Relayed hello?",
+                     "data_category": "general", "purpose": "answer"},
+            timestamp=NOW_ISO, expires_at=LIVE_EXP,
+            message_id="msg_drop001", correlation_id="corr_drop001",
+        ),
+        peer_priv,
+    )
+    sent_acks: list = []
+
+    class DroppingRelay:
+        async def receive_json(self):
+            if not hasattr(self, "_sent"):
+                self._sent = True
+                return {
+                    "type": "delivery",
+                    "relay_id": "dlv_drop001",
+                    "envelope": env,
+                }
+            raise rc.RelayError("DROPPED", "relay dropped the socket.")
+
+        async def send_json(self, frame):
+            if frame.get("type") == "delivery_ack":
+                sent_acks.append(frame.get("relay_id"))
+
+        async def close(self):
+            pass
+
+    async def _fake_connect(*args, **kwargs):
+        return DroppingRelay()
+
+    monkeypatch.setattr(ask_route.relay_client, "connect", _fake_connect)
+    with client.websocket_connect("/ask/live") as ws:
+        assert ws.receive_json()["type"] == "ready"
+        notice = ws.receive_json()
+        assert notice["type"] == "delivery"
+        assert notice["envelope"]["message_id"] == "msg_drop001"
+        # Relay drops right after: the bridge must tear down the
+        # browser socket (relay_down event and/or close) promptly.
+        box: dict = {}
+
+        def _wait_next():
+            try:
+                box["frame"] = ws.receive_json()
+            except WebSocketDisconnect as exc:
+                box["disconnect"] = exc
+            except Exception as exc:  # noqa: BLE001 - any close counts
+                box["error"] = exc
+
+        waiter = threading.Thread(target=_wait_next, daemon=True)
+        waiter.start()
+        waiter.join(timeout=8.0)
+        assert not waiter.is_alive(), "browser socket never tore down"
+        if "frame" in box:
+            assert isinstance(box["frame"], dict)
+            assert box["frame"].get("type") == "relay_down"
+            # After the event the socket must close too.
+            box2: dict = {}
+
+            def _wait_close():
+                try:
+                    box2["frame"] = ws.receive_json()
+                except WebSocketDisconnect as exc:
+                    box2["disconnect"] = exc
+                except Exception as exc:  # noqa: BLE001
+                    box2["error"] = exc
+
+            closer = threading.Thread(target=_wait_close, daemon=True)
+            closer.start()
+            closer.join(timeout=8.0)
+            assert not closer.is_alive(), "socket stayed open after relay_down"
+            assert "disconnect" in box2 or "error" in box2, box2
+        else:
+            assert "disconnect" in box or "error" in box, box
+    assert sent_acks == ["dlv_drop001"]
