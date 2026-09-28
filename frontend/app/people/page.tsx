@@ -50,7 +50,10 @@ export default function PeoplePage() {
     try {
       const data = await api<{ code: string }>("/pairing/invites", {
         method: "POST",
-        body: JSON.stringify({ card: {} }),
+        // No card payload: the server builds the invite card from the
+        // local key. Sending card-like fields is rejected (NOT_LOCAL_CARD
+        // unless the card belongs to the local identity).
+        body: JSON.stringify({}),
       });
       setInviteCode(data.code);
       setStatus("Invite created. Share the six words out of band.");

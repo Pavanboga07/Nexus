@@ -183,6 +183,68 @@ def create_invite(
     return {"code": code, "expires_at": _iso(expires_at)}
 
 
+DEFAULT_CARD_TTL_SECONDS = 365 * 24 * 3600  # 1 year agent-card lifetime
+DEFAULT_AGENT_ENDPOINT = "ws://localhost/ws"
+
+
+def build_local_card(
+    conn: sqlite3.Connection,
+    secret: str,
+    *,
+    display_name: str | None = None,
+    endpoint: str | None = None,
+) -> dict[str, Any]:
+    """Build + sign the 12-field invite card from the LOCAL key.
+
+    Primary invite path: the server mints the card so clients never send
+    key material or card JSON. Raises PairingError (NO_IDENTITY) when the
+    machine-local secret is missing or the stored identity is corrupt.
+    """
+    from app.identity import crypto
+    from app.identity.service import IdentityCorruptionError, load_identity
+    from relay.directory import sign_card
+    from relay.envelope import utc_iso_in, utc_now_iso
+
+    if not secret:
+        raise PairingError(
+            "NO_IDENTITY",
+            "identity secret is not configured.",
+            status=503,
+        )
+    try:
+        view = load_identity(conn, secret)
+    except IdentityCorruptionError as exc:
+        raise PairingError("NO_IDENTITY", str(exc), status=503) from exc
+    row = conn.execute(
+        "SELECT encrypted_private_key FROM identity WHERE id = 1"
+    ).fetchone()
+    try:
+        private_raw = crypto.decrypt_private_key(
+            row["encrypted_private_key"], secret
+        )
+        priv = crypto.load_private_key(private_raw)
+    except Exception as exc:
+        raise PairingError(
+            "NO_IDENTITY", f"local key is not usable: {exc}", status=503
+        ) from exc
+    return sign_card(
+        priv,
+        {
+            "type": "agent-card",
+            "protocol": "nexus-a2a",
+            "version": "0.3",
+            "agent_id": view.agent_id,
+            "display_name": display_name or view.agent_id,
+            "public_key": view.public_key,
+            "endpoint": endpoint or DEFAULT_AGENT_ENDPOINT,
+            "capabilities": [],
+            "supported_purposes": [],
+            "issued_at": utc_now_iso(),
+            "expires_at": utc_iso_in(DEFAULT_CARD_TTL_SECONDS),
+        },
+    )
+
+
 def verify_card_and_fingerprint(
     card: dict[str, Any], now: datetime | None = None
 ) -> tuple[str, str]:
@@ -376,6 +438,7 @@ __all__ = [
     "WORDLIST",
     "PairingError",
     "approve_peer",
+    "build_local_card",
     "claim_invite",
     "code_hash",
     "create_invite",

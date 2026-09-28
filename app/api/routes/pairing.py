@@ -22,7 +22,11 @@ router = APIRouter(prefix="/pairing", tags=["pairing"])
 
 
 class InviteIn(BaseModel):
-    card: dict[str, Any]
+    # Primary path sends NO card: the server builds it from the local
+    # key. A supplied card is only a legacy/defense path and must still
+    # belong to the local identity (else NOT_LOCAL_CARD).
+    card: dict[str, Any] | None = None
+    display_name: str | None = None
 
 
 class ClaimIn(BaseModel):
@@ -88,16 +92,27 @@ def create_invite_route(
     body: InviteIn, conn: sqlite3.Connection = Depends(get_conn)
 ):
     try:
-        card = body.card
-        if card.get("agent_id") != _local_agent_id(conn):
-            raise PairingError(
-                "NOT_LOCAL_CARD",
-                "invite cards must belong to the local identity.",
-                status=403,
+        if body.card is not None:
+            card = body.card
+            if card.get("agent_id") != _local_agent_id(conn):
+                raise PairingError(
+                    "NOT_LOCAL_CARD",
+                    "invite cards must belong to the local identity.",
+                    status=403,
+                )
+            agent_id = card["agent_id"]
+        else:
+            card = pairing.build_local_card(
+                conn,
+                os.environ.get("NEXUS_IDENTITY_KEY", ""),
+                display_name=body.display_name,
+                endpoint=os.environ.get("NEXUS_AGENT_ENDPOINT")
+                or pairing.DEFAULT_AGENT_ENDPOINT,
             )
+            agent_id = card["agent_id"]
         return pairing.create_invite(
             conn,
-            agent_id=card["agent_id"],
+            agent_id=agent_id,
             card=card,
             publish_fn=pairing.http_publish_transport(_relay_base()),
         )
