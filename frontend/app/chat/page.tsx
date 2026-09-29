@@ -37,10 +37,19 @@ type ChatMessage = {
 };
 
 type DeliveryStatus = {
-  mode: "relayed" | "local-only";
+  mode: "relayed" | "queued" | "delivery_failed" | "local-only";
   status?: string;
   reason?: string;
 };
+
+/** Observable delivery state for a stored row: "sent" means stored
+ * locally with background delivery in flight (refresh to confirm). */
+function deliveryLabel(status: string): string {
+  if (status === "relayed") return "relayed";
+  if (status === "delivery_failed") return "Delivery failed — retry";
+  if (status === "sent") return "Queued — delivering in background";
+  return status;
+}
 
 type ToAnswer = {
   correlation_id: string;
@@ -204,6 +213,13 @@ export default function ChatPage() {
   const [toAnswer, setToAnswer] = useState<ToAnswer[]>([]);
   const [answerText, setAnswerText] = useState<Record<string, string>>({});
   const [answering, setAnswering] = useState<string | null>(null);
+  const [retrying, setRetrying] = useState<string | null>(null);
+
+  // Polled rows indexed by id/correlation for delivery-state lookups.
+  const messagesById = new Map(messages.map((m) => [m.message_id, m]));
+  const messagesByCorrelation = new Map(
+    messages.map((m) => [m.correlation_id, m])
+  );
 
   const refresh = useCallback(async () => {
     try {
@@ -280,6 +296,14 @@ export default function ChatPage() {
         setStatus(
           `Question sent via relay (${delivery.status ?? "queued"}). The peer approves before answering.`
         );
+      } else if (delivery?.mode === "queued") {
+        setStatus(
+          "Queued — delivering in background; refresh to confirm."
+        );
+      } else if (delivery?.mode === "delivery_failed") {
+        setStatus(
+          `Delivery failed (${delivery.reason ?? "unknown"}) — retry from the message below.`
+        );
       } else if (delivery?.mode === "local-only") {
         setStatus(
           `Relay unreachable (${delivery.reason ?? "unknown"}) — question stored locally only.`
@@ -309,9 +333,13 @@ export default function ChatPage() {
         const via =
           data.delivery?.mode === "relayed"
             ? ` via relay (${data.delivery.status ?? "queued"})`
-            : data.delivery?.mode === "local-only"
-              ? " (relay unreachable — stored locally only)"
-              : "";
+            : data.delivery?.mode === "queued"
+              ? " (queued — delivering in background; refresh to confirm)"
+              : data.delivery?.mode === "delivery_failed"
+                ? " (delivery failed — retry from the message below)"
+                : data.delivery?.mode === "local-only"
+                  ? " (relay unreachable — stored locally only)"
+                  : "";
         if (verdict === "approve") {
           setStatus(`Approved${via}. An answer can follow.`);
           if (card) {
@@ -365,9 +393,13 @@ export default function ChatPage() {
         setStatus(
           delivery?.mode === "relayed"
             ? `Answer sent via relay (${delivery.status ?? "queued"}).`
-            : delivery?.mode === "local-only"
-              ? `Relay unreachable (${delivery.reason ?? "unknown"}) — answer stored locally only.`
-              : "Answer sent."
+            : delivery?.mode === "queued"
+              ? "Queued — delivering in background; refresh to confirm."
+              : delivery?.mode === "delivery_failed"
+                ? `Delivery failed (${delivery.reason ?? "unknown"}) — retry from the message below.`
+                : delivery?.mode === "local-only"
+                  ? `Relay unreachable (${delivery.reason ?? "unknown"}) — answer stored locally only.`
+                  : "Answer sent."
         );
         setToAnswer((prev) =>
           prev.filter((t) => t.correlation_id !== correlationId)
@@ -385,6 +417,31 @@ export default function ChatPage() {
       }
     },
     [toAnswer, answerText, answering, refresh]
+  );
+
+  const retryDelivery = useCallback(
+    async (messageId: string) => {
+      const row =
+        messagesById.get(messageId) ??
+        messagesByCorrelation.get(messageId);
+      if (!row || row.status !== "delivery_failed" || retrying) return;
+      setRetrying(row.message_id);
+      setError(null);
+      try {
+        await api(`/ask/messages/${row.message_id}/retry`, {
+          method: "POST",
+        });
+        setStatus(
+          "Retry queued — delivering in background; refresh to confirm."
+        );
+        await refresh();
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "Retry failed.");
+      } finally {
+        setRetrying(null);
+      }
+    },
+    [messagesById, messagesByCorrelation, retrying, refresh]
   );
 
   const runStream = useCallback(async () => {
@@ -612,7 +669,7 @@ export default function ChatPage() {
                       }
                     >
                       <p className="font-mono text-[11px] uppercase tracking-wide text-neutral-500">
-                        {msg.message_type} ({msg.status})
+                        {msg.message_type} ({deliveryLabel(msg.status)})
                       </p>
                       {body ? (
                         isRequest ? (
@@ -629,6 +686,19 @@ export default function ChatPage() {
                         <p className="mt-1 text-xs text-neutral-500">
                           {msg.sender} → {msg.recipient}
                         </p>
+                      )}
+                      {msg.status === "delivery_failed" && (
+                        <button
+                          type="button"
+                          onClick={() => void retryDelivery(msg.message_id)}
+                          disabled={retrying === msg.message_id}
+                          aria-label={`Retry delivery of ${msg.message_id}`}
+                          className="mt-2 inline-flex items-center justify-center rounded-md border border-amber-800 bg-amber-900/60 px-3 py-1 text-xs font-medium text-amber-100 hover:bg-amber-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/50 disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          {retrying === msg.message_id
+                            ? "Retrying…"
+                            : "Retry delivery"}
+                        </button>
                       )}
                     </div>
                   </li>

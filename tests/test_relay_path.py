@@ -4,8 +4,9 @@
 - Relay WebSocket speaks the exact ``relay/main.py`` frame protocol
   (auth_challenge/auth_response handshake, 4401 on failure,
   relay_envelope send, delivery_ack).
-- ``POST /ask`` relays (local-only fallback with clear status, never
-  silent); scripted two-profile ask->approve->answer runs over the test
+- ``POST /ask`` queues background delivery (queued immediately, relayed
+  / delivery_failed observable on refresh + retry; local-only only when
+  no relay is configured, never silent); scripted two-profile ask->approve->answer runs over the test
   relay instance (extends the V4 gate pattern).
 - ``/ask/live`` bridges relay deliveries to the chat browser (ingest +
   ack + forward); auth failure closes 4401.
@@ -466,10 +467,12 @@ def test_response_route_rejects_unknown_peer(tmp_path, monkeypatch):
     assert resp.json()["code"] == "NOT_PAIRED"
 
 
-def test_ask_route_reports_local_only_when_relay_unreachable(
+def test_ask_route_reports_queued_when_relay_unreachable(
     tmp_path, monkeypatch
 ):
-    """sendAsk never goes silent: unreachable relay -> clear status."""
+    """sendAsk never stalls and never lies: unreachable relay -> the
+    request returns queued immediately; the background worker flips the
+    stored row to delivery_failed (visible on refresh)."""
     client = _ask_client(
         tmp_path, monkeypatch, relay_url="http://127.0.0.1:1"
     )
@@ -480,17 +483,21 @@ def test_ask_route_reports_local_only_when_relay_unreachable(
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["envelope"]["message_type"] == "request"
-    assert body["delivery"]["mode"] == "local-only"
-    assert body["delivery"]["reason"]
+    assert body["delivery"]["mode"] == "queued"
+    assert "background" in body["delivery"].get("reason", "").lower()
+    rows = client.get("/ask/messages").json()["messages"]
+    assert [r["message_id"] for r in rows] == [body["message_id"]]
+    assert rows[0]["status"] == "delivery_failed"
 
 
 def test_ask_route_reports_relayed_when_delivered(tmp_path, monkeypatch):
     import app.api.routes.ask as ask_route
+    from app.a2a import relay_client as rc
 
-    def _fake_deliver(conn, envelope):
-        return {"mode": "relayed", "status": "delivered"}
+    async def _fake_deliver_one(*args, **kwargs):
+        return "delivered"
 
-    monkeypatch.setattr(ask_route, "_relay_delivery", _fake_deliver)
+    monkeypatch.setattr(rc, "deliver_one", _fake_deliver_one)
     client = _ask_client(
         tmp_path, monkeypatch, relay_url="http://relay.test"
     )
@@ -500,8 +507,11 @@ def test_ask_route_reports_relayed_when_delivered(tmp_path, monkeypatch):
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["delivery"] == {
-        "mode": "relayed", "status": "delivered"
+        "mode": "queued",
+        "reason": ask_route.QUEUED_DELIVERY["reason"],
     }
+    rows = client.get("/ask/messages").json()["messages"]
+    assert rows[0]["status"] == "relayed"
 
 
 def test_decide_routes_report_delivery(tmp_path, monkeypatch):
@@ -546,7 +556,7 @@ def test_decide_routes_report_delivery(tmp_path, monkeypatch):
     ]
     approved = client.post(f"/ask/approvals/{approval_id}/approve")
     assert approved.status_code == 200, approved.text
-    assert approved.json()["delivery"]["mode"] == "local-only"
+    assert approved.json()["delivery"]["mode"] == "queued"
 
 
 # --- /ask/live bridge ----------------------------------------------------------
@@ -665,11 +675,12 @@ def _free_refused_port():
     return port
 
 
-def test_ask_falls_back_fast_when_relay_refused(tmp_path, monkeypatch):
-    """RELAY-DOWN HANG: refused relay -> fast local-only fallback (<8s).
+def test_ask_returns_fast_when_relay_refused(tmp_path, monkeypatch):
+    """RELAY-DOWN HANG: refused relay -> immediate queued (<8s).
 
     Interactive timeouts stay aggressive (connect <=3s, ack wait <=5s)
-    via named constants; the status must name unreachability.
+    via named constants; the background worker records delivery_failed
+    for refresh/retry to observe.
     """
     import time
 
@@ -697,10 +708,11 @@ def test_ask_falls_back_fast_when_relay_refused(tmp_path, monkeypatch):
     elapsed = time.monotonic() - started
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["delivery"]["mode"] == "local-only"
-    assert "unreachable" in str(
-        body["delivery"].get("reason", "")).lower()
+    assert body["delivery"]["mode"] == "queued"
+    assert "background" in body["delivery"].get("reason", "").lower()
     assert elapsed < 8.0, elapsed
+    rows = client.get("/ask/messages").json()["messages"]
+    assert rows[0]["status"] == "delivery_failed"
 
 
 def test_live_bridge_tears_down_when_relay_drops(tmp_path, monkeypatch):

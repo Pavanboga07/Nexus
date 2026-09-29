@@ -9,11 +9,18 @@ locally and carried on the relay wire by the delivery path.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sqlite3
 from typing import Any
 
-from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -64,6 +71,20 @@ def _error(exc: A2AError) -> JSONResponse:
 
 def get_conn():
     """Per-request SQLite connection (migrated, closed after)."""
+    conn = _request_conn()
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def _request_conn() -> sqlite3.Connection:
+    """Open a migrated SQLite connection on the CALLING thread.
+
+    Async routes use this directly: a ``Depends(get_conn)`` connection
+    is created in a worker thread, but ``async def`` bodies run in the
+    event-loop thread, and SQLite refuses cross-thread use.
+    """
     from app.store import migrate, open_db
 
     path = os.environ.get("NEXUS_DB_PATH", "data/nexus.db")
@@ -72,10 +93,7 @@ def get_conn():
         os.makedirs(parent, exist_ok=True)
     conn = open_db(path)
     migrate(conn)
-    try:
-        yield conn
-    finally:
-        conn.close()
+    return conn
 
 
 def _local_key(conn: sqlite3.Connection):
@@ -124,25 +142,33 @@ def _local_pubkey(conn: sqlite3.Connection) -> str:
     return str(row["public_key"]) if row is not None else ""
 
 
-def _relay_delivery(conn: sqlite3.Connection, envelope: dict) -> dict:
-    """Push one signed envelope to the relay; never silent.
+QUEUED_DELIVERY = {
+    "mode": "queued",
+    "reason": "delivering in background; refresh to confirm",
+}
 
-    Returns ``{"mode": "relayed", "status": ...}`` on success and
-    ``{"mode": "local-only", "reason": ...}`` whenever the relay is
-    unconfigured or unreachable (the envelope stays stored locally).
+
+async def _background_deliver(
+    message_id: str, envelope: dict, db_path: str
+) -> None:
+    """Deliver one stored envelope; flip its row to relayed/failed.
+
+    Opens a FRESH connection (never the request ``conn``) so the HTTP
+    request never waits on the relay handshake. Ack -> ``relayed``;
+    any exception -> ``delivery_failed`` (both readable via
+    ``GET /ask/messages``).
     """
-    base = os.environ.get("NEXUS_RELAY_URL", "").strip()
-    if not base:
-        return {
-            "mode": "local-only",
-            "reason": "relay is not configured (set NEXUS_RELAY_URL).",
-        }
-    try:
-        from app.identity import crypto
+    from app.store import migrate, open_db
 
-        priv, agent_id = _local_key(conn)
-        status = asyncio.run(
-            relay_client.deliver_one(
+    conn = open_db(db_path)
+    migrate(conn)
+    try:
+        try:
+            from app.identity import crypto
+
+            base = os.environ.get("NEXUS_RELAY_URL", "").strip()
+            priv, agent_id = _local_key(conn)
+            await relay_client.deliver_one(
                 _relay_ws_url(base),
                 envelope,
                 recipient=envelope["recipient"],
@@ -152,14 +178,42 @@ def _relay_delivery(conn: sqlite3.Connection, envelope: dict) -> dict:
                 timeout=relay_client.CONNECT_TIMEOUT,
                 ack_timeout=relay_client.ACK_TIMEOUT,
             )
-        )
-        return {"mode": "relayed", "status": status}
-    except Exception as exc:  # noqa: BLE001 - fallback must never raise
-        return {"mode": "local-only", "reason": f"relay unreachable: {exc}"}
+            status = "relayed"
+        except Exception:  # noqa: BLE001 - failure is a row state
+            status = "delivery_failed"
+        with conn:
+            conn.execute(
+                "UPDATE a2a_messages SET status = ? WHERE message_id = ?",
+                (status, message_id),
+            )
+    finally:
+        conn.close()
+
+
+def _queue_delivery(
+    background: BackgroundTasks, signed: dict, db_path: str
+) -> dict:
+    """Return immediately; deliver in the background when configured.
+
+    No relay URL -> ``local-only`` (nothing to send to). Otherwise the
+    response is ``queued`` and ``_background_deliver`` flips the stored
+    row to ``relayed`` / ``delivery_failed`` for polling.
+    """
+    base = os.environ.get("NEXUS_RELAY_URL", "").strip()
+    if not base:
+        return {
+            "mode": "local-only",
+            "reason": "relay is not configured (set NEXUS_RELAY_URL).",
+        }
+    background.add_task(
+        _background_deliver, signed["message_id"], signed, db_path
+    )
+    return dict(QUEUED_DELIVERY)
 
 
 @router.post("")
-def ask_route(body: AskIn, conn: sqlite3.Connection = Depends(get_conn)):
+async def ask_route(body: AskIn, background: BackgroundTasks):
+    conn = _request_conn()
     try:
         priv, agent_id = _local_key(conn)
         signed = service.create_request(
@@ -176,17 +230,22 @@ def ask_route(body: AskIn, conn: sqlite3.Connection = Depends(get_conn)):
             "correlation_id": signed["correlation_id"],
             "recipient": signed["recipient"],
             "envelope": signed,
-            "delivery": _relay_delivery(conn, signed),
+            "delivery": _queue_delivery(
+                background,
+                signed,
+                os.environ.get("NEXUS_DB_PATH", "data/nexus.db"),
+            ),
         }
     except A2AError as exc:
         return _error(exc)
+    finally:
+        conn.close()
 
 
 @router.post("/response")
-def response_route(
-    body: ResponseIn, conn: sqlite3.Connection = Depends(get_conn)
-):
-    """Sign an answer (post-approval) and relay it to the requester."""
+async def response_route(body: ResponseIn, background: BackgroundTasks):
+    """Sign an answer (post-approval); delivery happens in background."""
+    conn = _request_conn()
     try:
         priv, agent_id = _local_key(conn)
         signed = service.send_response(
@@ -202,10 +261,16 @@ def response_route(
             "correlation_id": signed["correlation_id"],
             "recipient": signed["recipient"],
             "envelope": signed,
-            "delivery": _relay_delivery(conn, signed),
+            "delivery": _queue_delivery(
+                background,
+                signed,
+                os.environ.get("NEXUS_DB_PATH", "data/nexus.db"),
+            ),
         }
     except A2AError as exc:
         return _error(exc)
+    finally:
+        conn.close()
 
 
 @router.post("/incoming")
@@ -230,9 +295,8 @@ def approvals_route(
 
 
 @router.post("/approvals/{approval_id}/approve")
-def approve_route(
-    approval_id: str, conn: sqlite3.Connection = Depends(get_conn)
-):
+async def approve_route(approval_id: str, background: BackgroundTasks):
+    conn = _request_conn()
     try:
         priv, agent_id = _local_key(conn)
         signed = service.approve_approval(
@@ -242,18 +306,25 @@ def approve_route(
             "approval_id": approval_id,
             "status": "approved",
             "envelope": signed,
-            "delivery": _relay_delivery(conn, signed),
+            "delivery": _queue_delivery(
+                background,
+                signed,
+                os.environ.get("NEXUS_DB_PATH", "data/nexus.db"),
+            ),
         }
     except A2AError as exc:
         return _error(exc)
+    finally:
+        conn.close()
 
 
 @router.post("/approvals/{approval_id}/reject")
-def reject_route(
+async def reject_route(
     approval_id: str,
+    background: BackgroundTasks,
     body: RejectIn | None = None,
-    conn: sqlite3.Connection = Depends(get_conn),
 ):
+    conn = _request_conn()
     try:
         priv, agent_id = _local_key(conn)
         signed = service.reject_approval(
@@ -267,10 +338,16 @@ def reject_route(
             "approval_id": approval_id,
             "status": "rejected",
             "envelope": signed,
-            "delivery": _relay_delivery(conn, signed),
+            "delivery": _queue_delivery(
+                background,
+                signed,
+                os.environ.get("NEXUS_DB_PATH", "data/nexus.db"),
+            ),
         }
     except A2AError as exc:
         return _error(exc)
+    finally:
+        conn.close()
 
 
 @router.get("/messages")
@@ -279,6 +356,35 @@ def messages_route(
     conn: sqlite3.Connection = Depends(get_conn),
 ):
     return {"messages": service.list_messages(conn, correlation_id)}
+
+
+@router.post("/messages/{message_id}/retry")
+async def retry_route(message_id: str, background: BackgroundTasks):
+    """Re-queue background delivery for a ``delivery_failed`` row."""
+    conn = _request_conn()
+    try:
+        row = conn.execute(
+            "SELECT message_id, envelope_json, status FROM a2a_messages "
+            "WHERE message_id = ?",
+            (message_id,),
+        ).fetchone()
+        if row is None or row["status"] != "delivery_failed":
+            return JSONResponse(
+                status_code=404,
+                content={"detail": "message not found or not failed."},
+            )
+        background.add_task(
+            _background_deliver,
+            row["message_id"],
+            json.loads(row["envelope_json"]),
+            os.environ.get("NEXUS_DB_PATH", "data/nexus.db"),
+        )
+        return {
+            "message_id": row["message_id"],
+            "delivery": dict(QUEUED_DELIVERY),
+        }
+    finally:
+        conn.close()
 
 
 @router.get("/policy")
