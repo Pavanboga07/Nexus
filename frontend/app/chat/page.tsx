@@ -174,6 +174,23 @@ function messageBody(msg: ChatMessage): string {
   return "";
 }
 
+class ApiError extends Error {
+  status: number;
+  code?: string;
+  constructor(message: string, status: number, code?: string) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.code = code;
+  }
+}
+
+function isExpiredError(err: unknown): boolean {
+  return (
+    err instanceof ApiError && (err.code === "EXPIRED" || err.status === 410)
+  );
+}
+
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {
     ...init,
@@ -181,9 +198,14 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
   });
   const body = (await res.json().catch(() => ({}))) as T & {
     detail?: string;
+    code?: string;
   };
   if (!res.ok) {
-    throw new Error(body.detail ?? `request failed (${res.status})`);
+    throw new ApiError(
+      body.detail ?? `request failed (${res.status})`,
+      res.status,
+      body.code
+    );
   }
   return body;
 }
@@ -317,7 +339,11 @@ export default function ChatPage() {
       setQuestion("");
       await refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not send.");
+      if (isExpiredError(err)) {
+        setError("This request expired — ask again");
+      } else {
+        setError(err instanceof Error ? err.message : "Could not send.");
+      }
     } finally {
       setAskBusy(false);
     }
@@ -363,7 +389,11 @@ export default function ChatPage() {
         }
         await refresh();
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Decision failed.");
+        if (isExpiredError(err)) {
+          setError("This request expired — ask again");
+        } else {
+          setError(err instanceof Error ? err.message : "Decision failed.");
+        }
       } finally {
         setDeciding(null);
       }

@@ -494,6 +494,32 @@ def _get_approval(conn: sqlite3.Connection, approval_id: str) -> dict:
     return dict(row)
 
 
+def _check_approval_expiry(card: dict[str, Any], at: str) -> None:
+    """Reject expired or unparseable parked approvals (normalized)."""
+    raw = card.get("expires_at")
+    if raw is None or (isinstance(raw, str) and raw == ""):
+        raise A2AError(
+            "INVALID",
+            "approval has no expiry.",
+            status=400,
+        )
+    try:
+        exp = relay_envelope.parse_iso(raw)
+        now_dt = relay_envelope.parse_iso(at)
+    except (relay_envelope.EnvelopeError, TypeError, ValueError) as exc:
+        raise A2AError(
+            "INVALID",
+            f"approval expiry is invalid: {exc}",
+            status=410,
+        ) from exc
+    if exp <= now_dt:
+        raise A2AError(
+            "EXPIRED",
+            "approval has expired.",
+            status=410,
+        )
+
+
 def list_approvals(
     conn: sqlite3.Connection, status: str = "pending"
 ) -> list[dict[str, Any]]:
@@ -524,6 +550,7 @@ def approve_approval(
             f"approval is already {card['status']}.",
             status=409,
         )
+    _check_approval_expiry(card, at)
     with conn:
         conn.execute(
             "UPDATE a2a_approvals SET status = 'approved', "
@@ -560,6 +587,7 @@ def reject_approval(
             f"approval is already {card['status']}.",
             status=409,
         )
+    _check_approval_expiry(card, at)
     with conn:
         conn.execute(
             "UPDATE a2a_approvals SET status = 'rejected', "
