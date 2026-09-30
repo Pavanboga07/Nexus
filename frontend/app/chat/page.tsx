@@ -9,6 +9,32 @@ import { closeUnclosedFences, splitSegments } from "./markdown";
 const API_BASE =
   process.env.NEXT_PUBLIC_NEXUS_API ?? "http://127.0.0.1:8001";
 
+const SESSION_KEY = "nexus-session-id";
+
+function mintSessionId(): string {
+  return `chat-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/** Stable recall/extraction scope: read-or-create once per browser,
+ *  reused every turn (stream recall + extraction record the same id).
+ *  "New chat" mints and persists a fresh one. */
+function loadOrCreateSessionId(): string {
+  if (typeof localStorage === "undefined") return mintSessionId();
+  try {
+    const existing = localStorage.getItem(SESSION_KEY);
+    if (existing) return existing;
+  } catch {
+    /* storage unavailable — fall through to mint */
+  }
+  const fresh = mintSessionId();
+  try {
+    localStorage.setItem(SESSION_KEY, fresh);
+  } catch {
+    /* persistence is best-effort */
+  }
+  return fresh;
+}
+
 type Peer = {
   agent_id: string;
   display_name: string;
@@ -226,12 +252,10 @@ export default function ChatPage() {
   const [citations, setCitations] = useState<string[]>([]);
   const [streaming, setStreaming] = useState(false);
   const [streamError, setStreamError] = useState<string | null>(null);
-  // One recall/extraction scope per page load: stream recall injects
-  // only this session's memories, and extraction records the same id.
-  const [sessionId, setSessionId] = useState(
-    () =>
-      `chat-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
-  );
+  // Stable recall/extraction scope persisted across reloads: stream
+  // recall injects only this session's memories, and extraction records
+  // the same id. "New chat" below rotates it.
+  const [sessionId, setSessionId] = useState(loadOrCreateSessionId);
   // Sidebar visibility only: presentation state, no chat semantics.
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [live, setLive] = useState<"off" | "on" | "down">("off");
@@ -569,9 +593,13 @@ export default function ChatPage() {
     setToolCards([]);
     setCitations([]);
     setStreamError(null);
-    setSessionId(
-      `chat-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
-    );
+    const fresh = mintSessionId();
+    try {
+      localStorage.setItem(SESSION_KEY, fresh);
+    } catch {
+      /* persistence is best-effort */
+    }
+    setSessionId(fresh);
     setSidebarOpen(false);
   }, [streaming]);
 

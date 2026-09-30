@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import time
 
+from app.llm.provider import SYSTEM_PROMPT
+
 AT = "2026-09-22T09:00:00+00:00"
 
 
@@ -119,3 +121,59 @@ def test_extraction_records_session_id(tmp_path, monkeypatch):
     assert {
         r["session_id"] for r in rows if "Biscuit" in r["text"]
     } == {"chat-session-1"}
+
+
+def test_stream_slow_recall_falls_back_to_bare_prompt(tmp_path, monkeypatch):
+    """Recall exceeding 1.0s must not hold the turn: bounded elapsed."""
+    from app.memory.store import MemoryStore
+
+    db = str(tmp_path / "chat_slow.db")
+    _seed(db)
+    seen: dict = {}
+    client = _stream_client(monkeypatch, db, seen)
+
+    def slow_recall(self, *args, **kwargs):
+        time.sleep(5)
+        return [{"text": "My dog is called Biscuit."}]
+
+    monkeypatch.setattr(MemoryStore, "recall", slow_recall)
+    # Shared portal: a bare TestClient opens a fresh blocking portal per
+    # request whose teardown joins the timed-out worker thread
+    # (asyncio shutdown_default_executor), masking the turn latency
+    # this test bounds. Production (uvicorn) reuses one loop, so the
+    # orphaned worker never holds a turn there either.
+    with client:
+        start = time.monotonic()
+        resp = client.get(
+            "/chat/stream",
+            params={"message": "what is my dog called", "session_id": "A"},
+        )
+        elapsed = time.monotonic() - start
+        assert resp.status_code == 200, resp.text
+        assert elapsed < 4.0, f"recall blocked the turn for {elapsed:.1f}s"
+        assert seen["messages"][0]["role"] == "system"
+        assert seen["messages"][0]["content"] == SYSTEM_PROMPT
+        assert '"type": "done"' in resp.text or '"type":"done"' in resp.text
+
+
+def test_stream_recall_error_falls_back_to_bare_prompt(tmp_path, monkeypatch):
+    """Recall raising must not affect the turn (fail-open)."""
+    from app.memory.store import MemoryStore
+
+    db = str(tmp_path / "chat_boom.db")
+    _seed(db)
+    seen: dict = {}
+    client = _stream_client(monkeypatch, db, seen)
+
+    def boom(self, *args, **kwargs):
+        raise RuntimeError("recall exploded")
+
+    monkeypatch.setattr(MemoryStore, "recall", boom)
+    resp = client.get(
+        "/chat/stream",
+        params={"message": "what is my dog called", "session_id": "A"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert seen["messages"][0]["role"] == "system"
+    assert seen["messages"][0]["content"] == SYSTEM_PROMPT
+    assert '"type": "done"' in resp.text or '"type":"done"' in resp.text

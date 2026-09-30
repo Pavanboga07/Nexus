@@ -15,6 +15,7 @@ local machine config — see README).
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from typing import Any
@@ -92,7 +93,7 @@ async def _events(
     session_id: str = "",
 ) -> AsyncIterator[str]:
     messages = [
-        {"role": "system", "content": _system_prompt(message, session_id)},
+        {"role": "system", "content": await _system_prompt(message, session_id)},
         {"role": "user", "content": message},
     ]
 
@@ -124,23 +125,38 @@ async def _events(
         _extract_after_turn(message, assistant_text, session_id)
 
 
-def _system_prompt(message: str, session_id: str) -> str:
+def _recall_sync(db_path: str, message: str, session_id: str) -> list[dict]:
+    """Blocking recall on a FRESH store — runs in a worker thread only.
+
+    Never shares the request-thread store: the worker opens its own
+    ``MemoryStore`` and closes it before returning.
+    """
+    from app.memory.store import MemoryStore
+
+    store = MemoryStore(db_path)
+    try:
+        return store.recall(message, limit=5, session_id=session_id)
+    finally:
+        store.close()
+
+
+async def _system_prompt(message: str, session_id: str) -> str:
     """System prompt with session-scoped recall injected (best-effort).
 
     Memories stay scoped per session: only rows stored under this
-    ``session_id`` are injected. Recall never breaks the turn — any
-    failure falls back to the bare prompt.
+    ``session_id`` are injected. Recall runs in a worker thread with a
+    1.0s bound so slow sqlite-vec/embed work never holds first token —
+    any timeout or failure falls back to the bare prompt.
     """
+    import os
+
+    db_path = os.environ.get("NEXUS_DB_PATH", "data/nexus.db")
     try:
-        import os
-
-        from app.memory.store import MemoryStore
-
-        store = MemoryStore(os.environ.get("NEXUS_DB_PATH", "data/nexus.db"))
-        try:
-            hits = store.recall(message, limit=5, session_id=session_id)
-        finally:
-            store.close()
+        loop = asyncio.get_running_loop()
+        hits = await asyncio.wait_for(
+            loop.run_in_executor(None, _recall_sync, db_path, message, session_id),
+            timeout=1.0,
+        )
     except Exception:  # noqa: BLE001 - recall must not break chat
         return SYSTEM_PROMPT
     if not hits:
