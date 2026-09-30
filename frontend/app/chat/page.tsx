@@ -2,6 +2,7 @@
 
 import { Fragment, useCallback, useEffect, useState } from "react";
 import type { ReactNode } from "react";
+import Link from "next/link";
 
 import { closeUnclosedFences, splitSegments } from "./markdown";
 
@@ -205,10 +206,12 @@ export default function ChatPage() {
   const [streamError, setStreamError] = useState<string | null>(null);
   // One recall/extraction scope per page load: stream recall injects
   // only this session's memories, and extraction records the same id.
-  const [sessionId] = useState(
+  const [sessionId, setSessionId] = useState(
     () =>
       `chat-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
   );
+  // Sidebar visibility only: presentation state, no chat semantics.
+  const [sidebarOpen, setSidebarOpen] = useState(false);
   const [live, setLive] = useState<"off" | "on" | "down">("off");
   const [toAnswer, setToAnswer] = useState<ToAnswer[]>([]);
   const [answerText, setAnswerText] = useState<Record<string, string>>({});
@@ -526,6 +529,22 @@ export default function ChatPage() {
     }
   }, [streamInput, streaming, sessionId]);
 
+  // "New chat" rotates the recall/extraction scope and clears the
+  // session-scoped stream turn. Stored ask rows are global and reload
+  // from the server, so there is nothing local to clear for them.
+  const newChat = useCallback(() => {
+    if (streaming) return;
+    setStreamInput("");
+    setStreamText(null);
+    setToolCards([]);
+    setCitations([]);
+    setStreamError(null);
+    setSessionId(
+      `chat-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+    );
+    setSidebarOpen(false);
+  }, [streaming]);
+
   // Display-only derived values for the conversational thread layout.
   const selectedPeer = peers.find((p) => p.agent_id === peerId) ?? null;
   const pendingCount = cards.length;
@@ -553,11 +572,104 @@ export default function ChatPage() {
     !error;
 
   return (
-    <main className="flex min-h-[70vh] flex-col gap-4">
-      <header className="flex flex-wrap items-center gap-x-4 gap-y-2 rounded-lg border border-neutral-800 bg-neutral-900 px-3 py-2">
-        <h1 className="text-sm font-semibold tracking-tight text-neutral-50">
-          Chat
-        </h1>
+    <div className="flex min-h-screen bg-neutral-950 text-neutral-200">
+      {sidebarOpen && (
+        <button
+          type="button"
+          aria-label="Close sidebar"
+          onClick={() => setSidebarOpen(false)}
+          className="fixed inset-0 z-30 bg-black/60 md:hidden"
+        />
+      )}
+      <aside
+        id="chat-sidebar"
+        aria-label="Chat sidebar"
+        className={`fixed inset-y-0 left-0 z-40 flex w-64 shrink-0 -translate-x-full flex-col border-r border-neutral-800 bg-neutral-900 transition-transform md:static md:translate-x-0 ${
+          sidebarOpen ? "translate-x-0" : ""
+        }`}
+      >
+        <div className="flex items-center gap-2 p-3">
+          <button
+            type="button"
+            onClick={newChat}
+            disabled={streaming}
+            aria-label="Start a new chat"
+            className="inline-flex flex-1 items-center justify-center gap-2 rounded-lg border border-neutral-700 bg-neutral-950 px-3 py-2 text-sm font-medium text-neutral-100 hover:border-emerald-700 hover:text-emerald-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/50 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            <span aria-hidden="true" className="text-base leading-none">
+              +
+            </span>
+            New chat
+          </button>
+          <button
+            type="button"
+            onClick={() => setSidebarOpen(false)}
+            aria-label="Close sidebar"
+            className="inline-flex items-center justify-center rounded-lg border border-neutral-800 px-2 py-2 text-sm text-neutral-400 hover:text-neutral-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/50 md:hidden"
+          >
+            <span aria-hidden="true">✕</span>
+          </button>
+        </div>
+        <nav
+          aria-label="Secondary"
+          className="flex flex-col gap-1 px-3 text-sm"
+        >
+          <Link
+            href="/people"
+            className="rounded-lg px-3 py-2 text-neutral-300 hover:bg-neutral-800 hover:text-neutral-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-600"
+          >
+            People
+          </Link>
+          <Link
+            href="/memory"
+            className="rounded-lg px-3 py-2 text-neutral-300 hover:bg-neutral-800 hover:text-neutral-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-600"
+          >
+            Memory
+          </Link>
+        </nav>
+        <div className="mt-auto space-y-1 border-t border-neutral-800 p-3">
+          <p
+            aria-live="polite"
+            className="truncate font-mono text-[11px] text-neutral-500"
+          >
+            {selectedPeer
+              ? `${selectedPeer.display_name} · ${selectedPeer.fingerprint}`
+              : "no peer selected"}
+          </p>
+          <p className="text-xs text-neutral-500">
+            {live === "on" ? "live relay on" : "live relay off"}
+          </p>
+        </div>
+      </aside>
+
+      <div className="flex min-w-0 flex-1 flex-col">
+        <header className="sticky top-0 z-20 flex flex-wrap items-center gap-x-3 gap-y-2 border-b border-neutral-800 bg-neutral-950/95 px-3 py-2 backdrop-blur">
+          <button
+            type="button"
+            onClick={() => setSidebarOpen(true)}
+            aria-label="Open sidebar"
+            aria-expanded={sidebarOpen}
+            aria-controls="chat-sidebar"
+            className="inline-flex items-center justify-center rounded-md border border-neutral-800 px-2 py-1.5 text-neutral-300 hover:text-neutral-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/50 md:hidden"
+          >
+            <svg
+              aria-hidden="true"
+              width="18"
+              height="18"
+              viewBox="0 0 18 18"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+            >
+              <line x1="2" y1="4" x2="16" y2="4" />
+              <line x1="2" y1="9" x2="16" y2="9" />
+              <line x1="2" y1="14" x2="16" y2="14" />
+            </svg>
+          </button>
+          <h1 className="text-sm font-semibold tracking-tight text-neutral-50">
+            Chat
+          </h1>
         {peers.length === 0 ? (
           <p className="text-xs text-neutral-500">No paired peers yet.</p>
         ) : (
@@ -617,21 +729,22 @@ export default function ChatPage() {
         </span>
       </header>
 
-      <section
-        aria-labelledby="messages-heading"
-        className="flex min-h-[320px] flex-1 flex-col rounded-lg border border-neutral-800 bg-neutral-900"
-      >
-        <h2 id="messages-heading" className="sr-only">
-          Conversation
-        </h2>
-        {threadEmpty ? (
-          <div className="flex flex-1 items-center justify-center p-8">
-            <p className="text-center text-sm text-neutral-500">
-              No messages yet.
-            </p>
-          </div>
-        ) : (
-          <ul className="max-h-[55vh] min-h-[320px] flex-1 space-y-3 overflow-y-auto p-3 sm:p-4">
+        <main className="flex flex-1 flex-col px-3 py-4 sm:px-4">
+          <section
+            aria-labelledby="messages-heading"
+            className="mx-auto flex w-full max-w-3xl flex-1 flex-col"
+          >
+            <h2 id="messages-heading" className="sr-only">
+              Conversation
+            </h2>
+            {threadEmpty ? (
+              <div className="flex flex-1 items-center justify-center p-8">
+                <p className="text-center text-sm text-neutral-500">
+                  No messages yet.
+                </p>
+              </div>
+            ) : (
+              <ul className="flex-1 space-y-4">
             {status && (
               <li>
                 <p
@@ -658,14 +771,22 @@ export default function ChatPage() {
                 <Fragment key={msg.message_id}>
                   <li
                     className={
-                      isRequest ? "flex justify-end" : "flex justify-start"
+                      isRequest ? "flex justify-end" : "flex gap-2.5"
                     }
                   >
+                    {!isRequest && (
+                      <div
+                        aria-hidden="true"
+                        className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full border border-emerald-900 bg-emerald-950 text-xs font-semibold text-emerald-300"
+                      >
+                        N
+                      </div>
+                    )}
                     <div
                       className={
                         isRequest
                           ? "ml-auto max-w-[85%] rounded-2xl rounded-br-sm border border-emerald-900 bg-emerald-950/40 px-3 py-2"
-                          : "mr-auto max-w-[85%] rounded-2xl rounded-bl-sm border border-neutral-800 bg-neutral-950 px-3 py-2"
+                          : "min-w-0 flex-1 rounded-2xl border border-neutral-800 bg-neutral-950 px-3 py-2"
                       }
                     >
                       <p className="font-mono text-[11px] uppercase tracking-wide text-neutral-500">
@@ -706,7 +827,7 @@ export default function ChatPage() {
                     <li key={card.approval_id} className="flex justify-start">
                       <div
                         aria-label={`Approval ${card.action} for ${card.requester}`}
-                        className="mr-auto w-full max-w-[85%] space-y-3 rounded-2xl rounded-bl-sm border border-amber-900/60 bg-neutral-950 px-3 py-2"
+                        className="w-full space-y-3 rounded-2xl border border-amber-900/60 bg-neutral-950 px-3 py-2"
                       >
                         <h3 className="text-sm font-semibold text-neutral-100">
                           {card.action} for {card.requester}
@@ -770,7 +891,7 @@ export default function ChatPage() {
               <li key={card.approval_id} className="flex justify-start">
                 <div
                   aria-label={`Approval ${card.action} for ${card.requester}`}
-                  className="mr-auto w-full max-w-[85%] space-y-3 rounded-2xl rounded-bl-sm border border-amber-900/60 bg-neutral-950 px-3 py-2"
+                  className="w-full space-y-3 rounded-2xl border border-amber-900/60 bg-neutral-950 px-3 py-2"
                 >
                   <h3 className="text-sm font-semibold text-neutral-100">
                     {card.action} for {card.requester}
@@ -819,8 +940,14 @@ export default function ChatPage() {
               </li>
             ))}
             {hasStreamTurn && (
-              <li className="flex justify-start">
-                <div className="mr-auto w-full max-w-[85%] space-y-2 rounded-2xl rounded-bl-sm border border-neutral-800 bg-neutral-950 px-3 py-2">
+              <li className="flex gap-2.5">
+                <div
+                  aria-hidden="true"
+                  className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full border border-emerald-900 bg-emerald-950 text-xs font-semibold text-emerald-300"
+                >
+                  N
+                </div>
+                <div className="min-w-0 flex-1 space-y-2 rounded-2xl border border-neutral-800 bg-neutral-950 px-3 py-2">
                   {streamError && <ErrorState message={streamError} />}
                   {toolCards.length > 0 && (
                     <ul
@@ -889,15 +1016,15 @@ export default function ChatPage() {
                 </div>
               </li>
             )}
-          </ul>
-        )}
-      </section>
+              </ul>
+            )}
+          </section>
 
-      {toAnswer.length > 0 && (
-        <section
-          aria-labelledby="answer-heading"
-          className="space-y-3 rounded-lg border border-neutral-800 bg-neutral-900 p-3"
-        >
+          {toAnswer.length > 0 && (
+            <section
+              aria-labelledby="answer-heading"
+              className="mt-4 space-y-3 rounded-lg border border-neutral-800 bg-neutral-900 p-3"
+            >
           <h2
             id="answer-heading"
             className="text-xs font-semibold uppercase tracking-widest text-neutral-500"
@@ -948,98 +1075,125 @@ export default function ChatPage() {
                 </button>
               </li>
             ))}
-          </ul>
-        </section>
-      )}
+            </ul>
+          </section>
+          )}
+        </main>
 
-      <section
-        aria-labelledby="ask-heading"
-        className="rounded-lg border border-neutral-800 bg-neutral-900 p-3"
-      >
-        <h2 id="ask-heading" className="sr-only">
-          Ask
-        </h2>        {peers.length === 0 ? (
+        <footer className="sticky bottom-0 z-20 border-t border-neutral-800 bg-neutral-950 px-3 pb-4 pt-2 sm:px-4">
+          <div className="mx-auto w-full max-w-3xl space-y-2">
+            <section aria-labelledby="stream-heading">
+              <h2 id="stream-heading" className="sr-only">
+                Live search
+              </h2>
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  void runStream();
+                }}
+                className="flex items-center gap-2"
+              >
+                <div className="flex-1">
+                  <label htmlFor="stream-box" className="sr-only">
+                    Ask live
+                  </label>
+                  <textarea
+                    id="stream-box"
+                    value={streamInput}
+                    onChange={(e) => setStreamInput(e.target.value)}
+                    placeholder="Ask live… (web answer with sources)"
+                    rows={1}
+                    disabled={streaming || askBusy}
+                    className="w-full resize-none rounded-full border border-neutral-800 bg-neutral-900 px-3 py-1.5 text-sm text-neutral-200 placeholder:text-neutral-600 focus:border-emerald-600 focus:outline-none focus:ring-2 focus:ring-emerald-600/40 disabled:cursor-not-allowed disabled:opacity-50"
+                  />
+                </div>
+                <button
+                  type="submit"
+                  disabled={
+                    streaming || askBusy || streamInput.trim().length === 0
+                  }
+                  className="inline-flex shrink-0 items-center justify-center rounded-full border border-neutral-700 bg-neutral-950 px-3 py-1.5 text-xs font-medium text-neutral-200 hover:border-emerald-700 hover:text-emerald-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/50 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {streaming ? "Streaming…" : "Ask live"}
+                </button>
+              </form>
+            </section>
+
+            <section
+              aria-labelledby="ask-heading"
+              className="rounded-2xl border border-neutral-700 bg-neutral-900 p-2 focus-within:border-emerald-600 focus-within:ring-2 focus-within:ring-emerald-600/40"
+            >
+              <h2 id="ask-heading" className="sr-only">
+                Ask
+              </h2>
+              {peers.length === 0 ? (
           <p className="text-sm text-neutral-500">
             No paired peers yet. Pair one first.
           </p>
         ) : (
-          <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
-            <div className="flex-1">
-              <label htmlFor="question-box" className="sr-only">
-                Message
-              </label>
-              <textarea
-                id="question-box"
-                value={question}
-                onChange={(e) => setQuestion(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" && !e.shiftKey) {
-                    e.preventDefault();
-                    void sendAsk();
-                  }
-                }}
-                placeholder="Message… (Enter to send, Shift+Enter for a new line)"
-                rows={2}
-                disabled={askBusy || streaming}
-                className="w-full resize-none rounded-md border border-neutral-700 bg-neutral-950 px-3 py-2 text-sm text-neutral-200 placeholder:text-neutral-600 focus:border-emerald-600 focus:outline-none focus:ring-2 focus:ring-emerald-600/40 disabled:cursor-not-allowed disabled:opacity-50"
-              />
-            </div>
-            <button
-              type="button"
-              onClick={sendAsk}
-              disabled={
-                askBusy ||
-                streaming ||
-                !peerId ||
-                question.trim().length === 0
-              }
-              className="inline-flex shrink-0 items-center justify-center rounded-md bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-500 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/50 disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              {askBusy ? "Sending…" : "Send"}
-            </button>
+            <div className="flex items-end gap-2">
+              <div className="flex-1">
+                <label htmlFor="question-box" className="sr-only">
+                  Message
+                </label>
+                <textarea
+                  id="question-box"
+                  value={question}
+                  onChange={(e) => setQuestion(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && !e.shiftKey) {
+                      e.preventDefault();
+                      void sendAsk();
+                    }
+                  }}
+                  placeholder="Message… (Enter to send, Shift+Enter for a new line)"
+                  rows={2}
+                  disabled={askBusy || streaming}
+                  className="w-full resize-none bg-transparent px-3 py-2 text-sm text-neutral-200 placeholder:text-neutral-600 focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
+                />
+              </div>
+              <button
+                type="button"
+                onClick={sendAsk}
+                disabled={
+                  askBusy ||
+                  streaming ||
+                  !peerId ||
+                  question.trim().length === 0
+                }
+                aria-label="Send message"
+                className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-emerald-600 text-white hover:bg-emerald-500 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/50 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {askBusy ? (
+                  <span aria-hidden="true" className="text-sm leading-none">
+                    …
+                  </span>
+                ) : (
+                  <svg
+                    aria-hidden="true"
+                    width="16"
+                    height="16"
+                    viewBox="0 0 16 16"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  >
+                    <line x1="8" y1="14" x2="8" y2="2" />
+                    <polyline points="3 7 8 2 13 7" />
+                  </svg>
+                )}
+                <span className="sr-only">
+                  {askBusy ? "Sending…" : "Send"}
+                </span>
+              </button>
+              </div>
+              )}
+            </section>
           </div>
-        )}
-      </section>
-
-      <section
-        aria-labelledby="stream-heading"
-        className="rounded-lg border border-neutral-800 bg-neutral-900 p-3"
-      >
-        <h2 id="stream-heading" className="sr-only">
-          Live search
-        </h2>
-        <form
-          onSubmit={(e) => {
-            e.preventDefault();
-            void runStream();
-          }}
-          className="flex flex-col gap-2 sm:flex-row sm:items-center"
-        >
-          <div className="flex-1">
-            <label htmlFor="stream-box" className="sr-only">
-              Ask live
-            </label>
-            <textarea
-              id="stream-box"
-              value={streamInput}
-              onChange={(e) => setStreamInput(e.target.value)}
-              placeholder="Ask live… (web answer with sources)"
-              rows={1}
-              disabled={streaming || askBusy}
-              className="w-full resize-none rounded-md border border-neutral-700 bg-neutral-950 px-3 py-2 text-sm text-neutral-200 placeholder:text-neutral-600 focus:border-emerald-600 focus:outline-none focus:ring-2 focus:ring-emerald-600/40 disabled:cursor-not-allowed disabled:opacity-50"
-            />
-          </div>
-          <button
-            type="submit"
-            disabled={
-              streaming || askBusy || streamInput.trim().length === 0
-            }
-            className="inline-flex shrink-0 items-center justify-center rounded-md border border-neutral-700 bg-neutral-950 px-4 py-2 text-sm font-medium text-neutral-200 hover:border-emerald-700 hover:text-emerald-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/50 disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            {streaming ? "Streaming…" : "Ask live"}
-          </button>
-        </form>
-      </section>
-    </main>
+        </footer>
+      </div>
+    </div>
   );
 }

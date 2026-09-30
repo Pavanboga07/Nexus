@@ -1,4 +1,7 @@
+"use client";
+
 import Link from "next/link";
+import { usePathname } from "next/navigation";
 import "./globals.css";
 
 const navLink =
@@ -9,10 +12,18 @@ export default function RootLayout({
 }: {
   children: React.ReactNode;
 }) {
+  // The chat page brings its own full-height app shell (sidebar + thread
+  // + composer), so it renders full-bleed. Every other page keeps the
+  // existing centered shell unchanged.
+  const pathname = usePathname();
+  const isChat = pathname === "/chat" || pathname.startsWith("/chat/");
   return (
     <html lang="en">
       <body className="min-h-screen bg-neutral-950 text-neutral-200 antialiased">
-        <div className="mx-auto flex min-h-screen w-full max-w-3xl flex-col px-4 py-6 sm:px-6">
+        {isChat ? (
+          <div className="flex min-h-screen w-full flex-col">{children}</div>
+        ) : (
+          <div className="mx-auto flex min-h-screen w-full max-w-3xl flex-col px-4 py-6 sm:px-6">
           <header className="mb-6 flex flex-wrap items-center justify-between gap-3 border-b border-neutral-800 pb-4">
             <span className="text-sm font-semibold tracking-tight text-neutral-50">
               Nexus
@@ -33,7 +44,8 @@ export default function RootLayout({
           <footer className="mt-8 border-t border-neutral-800 pt-4 text-xs text-neutral-500">
             Local-first pair. Approvals stay on this machine.
           </footer>
-        </div>
+          </div>
+        )}
       </body>
     </html>
   );
