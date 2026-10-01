@@ -1,0 +1,44 @@
+# nexus-v1 test image: backend (uvicorn :8001) + frontend (next start :3001).
+# Secrets and identity NEVER baked in — pass -e at `docker run`, persist
+# identity/memory in a mounted /data volume or they vanish with the container.
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    NODE_VERSION=20.19.0
+
+# Node.js (for the frontend server) + build deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl ca-certificates xz-utils \
+ && curl -fsSLO "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" \
+ && tar -xJf "node-v${NODE_VERSION}-linux-x64.tar.xz" -C /usr/local --strip-components=1 \
+ && rm "node-v${NODE_VERSION}-linux-x64.tar.xz" \
+ && apt-get purge -y curl xz-utils && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Python deps first (layer cache)
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Frontend deps + full source, then build (source must exist before build)
+COPY frontend/package.json frontend/package-lock.json* ./frontend/
+RUN cd frontend && (npm ci || npm install)
+COPY frontend ./frontend/
+ARG NEXT_PUBLIC_NEXUS_API=http://127.0.0.1:8001
+ENV NEXT_PUBLIC_NEXUS_API=$NEXT_PUBLIC_NEXUS_API
+RUN cd frontend && npm run build
+
+# App code + relay package (app imports relay.envelope) + data dir
+COPY app ./app
+COPY relay ./relay
+COPY tests ./tests
+COPY pytest.ini ./
+COPY frontend ./frontend
+RUN mkdir -p /data
+ENV NEXUS_DB_PATH=/data/nexus.db
+
+EXPOSE 8001 3001
+COPY scripts/docker-start.sh /usr/local/bin/docker-start.sh
+RUN chmod +x /usr/local/bin/docker-start.sh
+CMD ["docker-start.sh"]
