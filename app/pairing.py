@@ -201,7 +201,10 @@ def build_local_card(
     machine-local secret is missing or the stored identity is corrupt.
     """
     from app.identity import crypto
-    from app.identity.service import IdentityCorruptionError, load_identity
+    from app.identity.service import (
+        IdentityCorruptionError,
+        ensure_identity,
+    )
     from relay.directory import sign_card
     from relay.envelope import utc_iso_in, utc_now_iso
 
@@ -212,7 +215,9 @@ def build_local_card(
             status=503,
         )
     try:
-        view = load_identity(conn, secret)
+        # ensure: first use initializes the identity; NO_IDENTITY survives
+        # only for genuinely corrupt stores.
+        view = ensure_identity(conn, secret)
     except IdentityCorruptionError as exc:
         raise PairingError("NO_IDENTITY", str(exc), status=503) from exc
     row = conn.execute(

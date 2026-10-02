@@ -105,14 +105,20 @@ class LLMConfig:
 
 
 def get_llm_config() -> LLMConfig:
-    """Read the machine-local model config. Raises MissingKeyError."""
-    api_key = os.environ.get("NEXUS_LLM_API_KEY", "").strip()
+    """Read the machine-local model config. Raises MissingKeyError.
+
+    Resolution order: stored file key (settings UI) -> NEXUS_LLM_API_KEY
+    env -> missing. The stored key applies without a restart (resolved
+    per turn, no cache).
+    """
+    from app.machine_config import resolve_llm_key
+
+    api_key = (resolve_llm_key() or "").strip()
     if not api_key:
         raise MissingKeyError(
-            "MISSING_KEY: NEXUS_LLM_API_KEY is not set. Set it in the "
-            "local environment (or machine config file exporting it) "
-            "before using /chat/stream. No settings UI yet — it arrives "
-            "with packaging."
+            "MISSING_KEY: no model key is configured. Paste your key in "
+            "the UI (Chat settings) or set NEXUS_LLM_API_KEY before "
+            "using /chat/stream."
         )
     base_url = (
         os.environ.get("NEXUS_LLM_BASE_URL", "").strip()

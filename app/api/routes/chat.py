@@ -9,8 +9,8 @@ OpenAI-compatible model and streams Server-Sent Events:
 - ``done`` — final text + citations
 - ``error`` — failure code + message
 
-Missing model key → 503 ``MISSING_KEY`` (no settings UI in v1; key via
-local machine config — see README).
+Missing model key → 503 ``MISSING_KEY`` (paste the key in the UI
+under Chat settings, or set it via local machine config — see README).
 """
 
 from __future__ import annotations

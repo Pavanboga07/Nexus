@@ -369,9 +369,11 @@ def test_quarantine_poisoned_page_quoted_not_obeyed():
     assert "https://example.com/tricky" in done["text"]
 
 # SECTION: endpoint
-def test_missing_key_is_clear(monkeypatch):
+def test_missing_key_is_clear(monkeypatch, tmp_path):
     from app.llm.provider import MissingKeyError, get_llm_config
 
+    # Isolate the machine file: a stored key must not leak into this test.
+    monkeypatch.setenv("NEXUS_DB_PATH", str(tmp_path / "nexus.db"))
     monkeypatch.delenv("NEXUS_LLM_API_KEY", raising=False)
     with pytest.raises(MissingKeyError, match="MISSING_KEY"):
         get_llm_config()

@@ -72,17 +72,17 @@ def _relay_base() -> str:
 
 
 def _local_agent_id(conn: sqlite3.Connection) -> str:
-    from app.identity.service import IdentityCorruptionError, load_identity
+    from app.identity.service import IdentityCorruptionError, ensure_identity
+    from app.machine_config import MachineConfigError, get_or_create_identity_secret
 
-    secret = os.environ.get("NEXUS_IDENTITY_KEY", "")
-    if not secret:
-        raise PairingError(
-            "NO_IDENTITY",
-            "identity secret is not configured.",
-            status=503,
-        )
     try:
-        return load_identity(conn, secret).agent_id
+        secret = get_or_create_identity_secret()
+    except MachineConfigError as exc:
+        raise PairingError("NO_IDENTITY", str(exc), status=503) from exc
+    try:
+        # ensure: first pairing call initializes the identity; NO_IDENTITY
+        # survives only for genuinely corrupt stores.
+        return ensure_identity(conn, secret).agent_id
     except IdentityCorruptionError as exc:
         raise PairingError("NO_IDENTITY", str(exc), status=503) from exc
 
@@ -102,9 +102,18 @@ def create_invite_route(
                 )
             agent_id = card["agent_id"]
         else:
+            from app.machine_config import (
+                MachineConfigError,
+                get_or_create_identity_secret,
+            )
+
+            try:
+                secret = get_or_create_identity_secret()
+            except MachineConfigError as exc:
+                raise PairingError("NO_IDENTITY", str(exc), status=503) from exc
             card = pairing.build_local_card(
                 conn,
-                os.environ.get("NEXUS_IDENTITY_KEY", ""),
+                secret,
                 display_name=body.display_name,
                 endpoint=os.environ.get("NEXUS_AGENT_ENDPOINT")
                 or pairing.DEFAULT_AGENT_ENDPOINT,

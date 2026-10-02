@@ -97,21 +97,21 @@ def _request_conn() -> sqlite3.Connection:
 
 
 def _local_key(conn: sqlite3.Connection):
-    """Local (private key, agent_id); 503 when identity is missing."""
+    """Local (private key, agent_id); 503 when identity is corrupt."""
     import base64
 
     from app.identity import crypto
-    from app.identity.service import IdentityCorruptionError, load_identity
+    from app.identity.service import IdentityCorruptionError, ensure_identity
+    from app.machine_config import MachineConfigError, get_or_create_identity_secret
 
-    secret = os.environ.get("NEXUS_IDENTITY_KEY", "")
-    if not secret:
-        raise A2AError(
-            "NO_IDENTITY",
-            "identity secret is not configured.",
-            status=503,
-        )
     try:
-        view = load_identity(conn, secret)
+        secret = get_or_create_identity_secret()
+    except MachineConfigError as exc:
+        raise A2AError("NO_IDENTITY", str(exc), status=503) from exc
+    try:
+        # ensure: the secret self-generates and the identity initializes
+        # on first need; NO_IDENTITY survives only for corrupt stores.
+        view = ensure_identity(conn, secret)
     except IdentityCorruptionError as exc:
         raise A2AError("NO_IDENTITY", str(exc), status=503) from exc
     row = conn.execute(
