@@ -1,12 +1,12 @@
 #!/bin/bash
 # Container entrypoint: backend API (:8001) + frontend (:3001).
-# Required env (fail loud, never defaults for secrets):
-#   NEXUS_IDENTITY_KEY - generated per machine, see README
-#   NEXUS_LLM_API_KEY  - owner's own model key
-# Optional: NEXUS_LLM_BASE_URL, NEXUS_LLM_MODEL, NEXUS_RELAY_URL, PORT_API, PORT_UI
+# Zero secrets required: the identity secret self-generates into the
+# data dir on first need, and the model key is pasted in the UI (Chat
+# settings, verified live before it is stored).
+# Optional env overrides (all unset by default):
+#   NEXUS_IDENTITY_KEY, NEXUS_LLM_API_KEY, NEXUS_LLM_BASE_URL,
+#   NEXUS_LLM_MODEL, NEXUS_RELAY_URL, NEXUS_DB_PATH, PORT_API, PORT_UI
 set -e
-: "${NEXUS_IDENTITY_KEY:?Set NEXUS_IDENTITY_KEY (generate one per machine, never share it)}"
-: "${NEXUS_LLM_API_KEY:?Set NEXUS_LLM_API_KEY (the owner model key)}"
 API_PORT="${PORT_API:-8001}"
 UI_PORT="${PORT_UI:-3001}"
 mkdir -p "$(dirname "${NEXUS_DB_PATH:-/data/nexus.db}")"

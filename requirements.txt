@@ -4,7 +4,7 @@ pydantic
 httpx
 pytest
 cryptography==46.0.1
-sqlalchemy
+sqlalchemy[asyncio]
 asyncpg
 alembic
 sqlite-vec==0.1.6

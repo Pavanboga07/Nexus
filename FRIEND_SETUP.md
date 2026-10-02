@@ -11,8 +11,12 @@ signed messages relayed through our shared relay.
 - **A free Gemini API key** (yours alone, never shared):
   1. Go to https://aistudio.google.com/apikey
   2. Sign in with your Google account → **Create API key** → copy it.
-- **Your own identity secret** — you will generate this below. It is the
-  master secret of YOUR agent. Never send it to anyone, including me.
+  3. Keep it handy — you paste it inside the app in step 3, not in
+     the terminal.
+
+Your agent's identity secret is created automatically on first start and
+stays in your private data volume. There is nothing to generate, copy,
+or paste for it.
 
 ## 1. Get the app (no source code, no builds)
 
@@ -29,30 +33,15 @@ docker pull pavanboga07/nexus-v1:latest
 then `docker build -f Dockerfile.friend -t nexus-v1-friend .` — same result,
 ~5 minutes.)
 
-## 3. Create YOUR identity secret (yours alone — generate, never copy mine)
-
-```powershell
-python -c "import secrets; print(secrets.token_urlsafe(32))"
-```
-
-Copy the output. If you don't have Python, use any password generator
-with 40+ random characters — but Python one-liner above is easiest
-(Windows ships it? if not, install Python 3.12 from python.org first).
-
-## 4. Start it (replace the two placeholders, keep the quotes)
+## 2. Start it (no secrets, no setup)
 
 ```powershell
 docker run -d --name nexus -p 8001:8001 -p 3001:3001 -v nexus-data:/data `
-  -e NEXUS_IDENTITY_KEY="<paste YOUR generated secret>" `
-  -e NEXUS_LLM_API_KEY="<paste YOUR Gemini key>" `
-  -e NEXUS_LLM_BASE_URL="https://generativelanguage.googleapis.com/v1beta/openai/" `
-  -e NEXUS_LLM_MODEL="gemini-3.6-flash" `
-  -e NEXUS_RELAY_URL="wss://nexus-gateway-mv63.onrender.com" `
   pavanboga07/nexus-v1:latest
 ```
 
-(Backticks mean "continues on next line" — or paste it all as one line
-without backticks.)
+That is the whole command — no `-e` flags. Your identity is created
+inside `nexus-data` on first start.
 
 Check it's up:
 
@@ -60,27 +49,53 @@ Check it's up:
 docker logs nexus
 ```
 
-You should see `Uvicorn running` and no Traceback. Then open
-**http://localhost:3001/chat** — say hi to your agent.
+You should see `Uvicorn running` and no Traceback.
 
-## 5. Pair with me
+## 3. Paste your model key in the app
+
+1. Open **http://localhost:3001/chat**.
+2. At the top, in **Model key**, paste your Gemini key → **Save key**.
+3. The key is checked live before it is saved: a bad key is rejected
+   with the provider's message and never stored. When it says
+   **Configured**, say hi to your agent.
+4. To change it later, paste a new key in the same box (**Rotate key**) —
+   same check, same box.
+
+Manual live check (proves the saved key works end to end): after
+**Configured** appears, send a chat message and confirm you get an
+answer with sources. If chat says the key is missing instead, re-paste
+it and try again.
+
+## 4. Pair with me
 
 1. I create an invite and READ YOU the code over a call (never chat/email).
 2. People page → enter it within 15 minutes.
 3. Compare the fingerprint on your screen with mine, character by character.
 4. Both approve → we're connected.
 
-## 6. Daily use
+## 5. Daily use
 
 - Open http://localhost:3001/chat. Start Docker first if it was closed.
-- Your data lives in the `nexus-data` volume — `docker rm nexus` never
-  deletes it. To erase everything (new identity!): `docker volume rm nexus-data`.
+- Your data (identity + memories + model key) lives in the `nexus-data`
+  volume — `docker rm nexus` never deletes it. To erase everything (new
+  identity!): `docker volume rm nexus-data`.
 - To update to a newer version I send: rebuild, stop old, start new with
-  the SAME `-v nexus-data:/data` and SAME secrets — identity and memory survive.
+  the SAME `-v nexus-data:/data` — identity, memory, and key survive.
+  Nothing to re-enter.
 - Logs when something breaks: `docker logs nexus` — send me the last 20 lines.
+
+## Optional overrides (advanced — skip unless I ask)
+
+The image already points at the shared relay and the Gemini-compatible
+provider. If I ever ask you to aim elsewhere, add `-e` flags to the
+`docker run` command above, e.g. `-e NEXUS_LLM_MODEL="other-model"`.
+Explicit `-e` values always win over the built-ins (and over the key
+saved in the app, for the model key). You never need these for normal use.
 
 ## Rules (short version)
 
-1. Your `NEXUS_IDENTITY_KEY` is yours alone. Never share it.
-2. Your model key is yours alone. Get your own free one.
+1. Your identity secret is yours alone. It lives inside your `nexus-data`
+   volume — never copy it out, never share it, not even with me.
+2. Your model key is yours alone. Get your own free one, and paste it
+   only into YOUR app's Model key box.
 3. You need nothing else: no database, no accounts, no code tools.

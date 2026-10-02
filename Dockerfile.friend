@@ -1,6 +1,8 @@
 # nexus-v1 test image: backend (uvicorn :8001) + frontend (next start :3001).
-# Secrets and identity NEVER baked in — pass -e at `docker run`, persist
-# identity/memory in a mounted /data volume or they vanish with the container.
+# Secrets are NEVER baked in — the container boots with no -e flags:
+# identity self-generates into the mounted /data volume and the model
+# key is pasted in the UI. Persist identity/memory in a mounted /data
+# volume or they vanish with the container.
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -37,6 +39,12 @@ COPY pytest.ini ./
 COPY frontend ./frontend
 RUN mkdir -p /data
 ENV NEXUS_DB_PATH=/data/nexus.db
+# Friend defaults (not secrets — safe to bake in, override with -e if asked):
+# Gemini-compatible provider + shared relay. The model KEY itself is
+# pasted in the UI, never passed at `docker run`.
+ENV NEXUS_LLM_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai/
+ENV NEXUS_LLM_MODEL=gemini-3.6-flash
+ENV NEXUS_RELAY_URL=wss://nexus-gateway-mv63.onrender.com
 
 EXPOSE 8001 3001
 COPY scripts/docker-start.sh /usr/local/bin/docker-start.sh
