@@ -84,7 +84,12 @@ CREATE TABLE IF NOT EXISTS policy_rules (
 
 def open_db(path: str | Path) -> sqlite3.Connection:
     """Open a SQLite file with sane V1 defaults (no migration side effect)."""
-    conn = sqlite3.connect(str(path))
+    # check_same_thread=False: route dependencies are generator-based
+    # (``yield conn`` + close in finally), and FastAPI/anyio may run
+    # setup, route body, and teardown on DIFFERENT worker threads.
+    # The default True then raises ProgrammingError on the hop. SQLite's
+    # own locking serializes writers; timeout covers contention.
+    conn = sqlite3.connect(str(path), check_same_thread=False, timeout=30.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
