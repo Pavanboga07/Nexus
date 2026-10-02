@@ -14,17 +14,20 @@ signed messages relayed through our shared relay.
 - **Your own identity secret** — you will generate this below. It is the
   master secret of YOUR agent. Never send it to anyone, including me.
 
-## 1. Get the app
+## 1. Get the app (no source code, no builds)
 
-Unzip the `nexus-v1-friend.zip` I sent you anywhere, e.g.
-`Documents\nexus-v1`. Open **PowerShell** in that folder
-(Shift + right-click → "Open PowerShell window here").
+You need **Docker Desktop for Windows** only (docker.com → download,
+install with defaults, start it, wait until it says running).
 
-## 2. Build it (one command, ~3 minutes first time)
+Pull the ready-made image (about 2 GB, one time):
 
 ```powershell
-docker build -f Dockerfile.friend -t nexus-v1-friend .
+docker pull pavanboga07/nexus-v1:latest
 ```
+
+(Fallback if pull fails: unzip the `nexus-v1-friend.zip` I sent separately,
+then `docker build -f Dockerfile.friend -t nexus-v1-friend .` — same result,
+~5 minutes.)
 
 ## 3. Create YOUR identity secret (yours alone — generate, never copy mine)
 
@@ -45,7 +48,7 @@ docker run -d --name nexus -p 8001:8001 -p 3001:3001 -v nexus-data:/data `
   -e NEXUS_LLM_BASE_URL="https://generativelanguage.googleapis.com/v1beta/openai/" `
   -e NEXUS_LLM_MODEL="gemini-3.6-flash" `
   -e NEXUS_RELAY_URL="wss://nexus-gateway-mv63.onrender.com" `
-  nexus-v1-friend
+  pavanboga07/nexus-v1:latest
 ```
 
 (Backticks mean "continues on next line" — or paste it all as one line
