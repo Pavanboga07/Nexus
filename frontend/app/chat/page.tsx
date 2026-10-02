@@ -236,6 +236,129 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
   return body;
 }
 
+type LlmStatus = {
+  configured: boolean;
+  provider_hint: string;
+};
+
+/** Model-key settings: paste/rotate the key in the UI (verified live
+ *  server-side before it is stored). Same form overwrites on rotate. */
+function LlmKeySettings() {
+  const [status, setStatus] = useState<LlmStatus | null>(null);
+  const [keyInput, setKeyInput] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState<string | null>(null);
+  const [keyError, setKeyError] = useState<string | null>(null);
+
+  const loadStatus = useCallback(async () => {
+    try {
+      setStatus(await api<LlmStatus>("/settings/llm-status"));
+    } catch {
+      /* best-effort: the stream surfaces MISSING_KEY either way */
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadStatus();
+  }, [loadStatus]);
+
+  const saveKey = useCallback(async () => {
+    const key = keyInput.trim();
+    if (key.length === 0 || saving) return;
+    setSaving(true);
+    setKeyError(null);
+    setSaved(null);
+    try {
+      await api("/settings/llm-key", {
+        method: "POST",
+        body: JSON.stringify({ key }),
+      });
+      setKeyInput("");
+      setSaved("Model key saved — chat is ready.");
+      await loadStatus();
+    } catch (err) {
+      setKeyError(err instanceof Error ? err.message : "Could not save key.");
+    } finally {
+      setSaving(false);
+    }
+  }, [keyInput, saving, loadStatus]);
+
+  return (
+    <section
+      aria-labelledby="llm-key-heading"
+      className="mb-4 rounded-lg border border-neutral-800 bg-neutral-900 p-3"
+    >
+      <h2
+        id="llm-key-heading"
+        className="text-xs font-semibold uppercase tracking-widest text-neutral-500"
+      >
+        Model key
+      </h2>
+      <p aria-live="polite" className="mt-1 text-sm text-neutral-400">
+        {status
+          ? status.configured
+            ? `Configured (${status.provider_hint})`
+            : `No model key yet — paste your Gemini key (${status.provider_hint})`
+          : "Checking model key…"}
+      </p>
+      {saved && (
+        <p
+          role="status"
+          className="mt-2 rounded-lg border border-emerald-900 bg-emerald-950 px-3 py-2 text-sm text-emerald-200"
+        >
+          {saved}
+        </p>
+      )}
+      {keyError && (
+        <div className="mt-2">
+          <ErrorState message={keyError} />
+        </div>
+      )}
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          void saveKey();
+        }}
+        className="mt-2 flex flex-col gap-2 sm:flex-row sm:items-end"
+      >
+        <div className="flex-1 space-y-1">
+          <label
+            htmlFor="llm-key-input"
+            className="block text-xs font-medium uppercase tracking-wide text-neutral-500"
+          >
+            {status?.configured ? "Rotate key (paste new)" : "Gemini API key"}
+          </label>
+          <input
+            id="llm-key-input"
+            type="password"
+            value={keyInput}
+            onChange={(e) => setKeyInput(e.target.value)}
+            placeholder="Paste key…"
+            autoComplete="off"
+            disabled={saving}
+            className="w-full rounded-md border border-neutral-700 bg-neutral-950 px-3 py-2 font-mono text-sm text-neutral-200 placeholder:text-neutral-600 focus:border-emerald-600 focus:outline-none focus:ring-2 focus:ring-emerald-600/40 disabled:cursor-not-allowed disabled:opacity-50"
+          />
+        </div>
+        <button
+          type="submit"
+          disabled={saving || keyInput.trim().length === 0}
+          className="inline-flex shrink-0 items-center justify-center rounded-md bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-500 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/50 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          {saving
+            ? "Verifying…"
+            : status?.configured
+              ? "Rotate key"
+              : "Save key"}
+        </button>
+      </form>
+      <p className="mt-2 text-xs text-neutral-500">
+        Verified live before it replaces the old one — a bad key is rejected
+        and never stored.
+      </p>
+    </section>
+  );
+}
+
 export default function ChatPage() {
   const [peers, setPeers] = useState<Peer[]>([]);
   const [peerId, setPeerId] = useState("");
@@ -795,6 +918,7 @@ export default function ChatPage() {
             <h2 id="messages-heading" className="sr-only">
               Conversation
             </h2>
+            <LlmKeySettings />
             {threadEmpty ? (
               <div className="flex flex-1 items-center justify-center p-8">
                 <p className="text-center text-sm text-neutral-500">
