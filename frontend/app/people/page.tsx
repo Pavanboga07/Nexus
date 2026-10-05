@@ -183,10 +183,11 @@ export default function PeoplePage() {
     <main className="mx-auto w-full max-w-3xl space-y-8 px-4 py-8 sm:px-6">
       <div className="space-y-1">
         <h1 className="text-2xl font-semibold tracking-tight text-ink">
-          People
+          Network
         </h1>
         <p className="text-sm text-ink-2">
-          Pair with an invite code. No QR codes in v1.
+          Connected agents, pending invitations, and trust. Pair with an
+          invite code to let agents talk to each other.
         </p>
       </div>
 
@@ -308,14 +309,17 @@ export default function PeoplePage() {
           id="peers-heading"
           className="text-xs font-semibold uppercase tracking-widest text-ink-3"
         >
-          Paired peers
+          Connected agents
         </h2>
         {peersLoading ? (
           <p aria-live="polite" className="text-sm text-ink-3">
             Loading peers…
           </p>
         ) : peers.length === 0 ? (
-          <p className="text-sm text-ink-3">No peers yet.</p>
+          <p className="text-sm text-ink-3">
+            No connected agents yet. Generate an invite above — or claim one
+            someone shared with you.
+          </p>
         ) : (
           <ul className="divide-y divide-line">
             {peers.map((peer) => {

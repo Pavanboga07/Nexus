@@ -1,6 +1,6 @@
 "use client";
 
-import { Fragment, Suspense, useCallback, useEffect, useRef, useState } from "react";
+import { Fragment, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
@@ -104,6 +104,184 @@ function peerDisplayName(
   return id.length > 24 ? `${id.slice(0, 12)}…` : id;
 }
 
+type CommGroup = {
+  correlationId: string;
+  request: ChatMessage | null;
+  response: ChatMessage | null;
+  others: ChatMessage[];
+};
+
+function groupCompletedExchanges(messages: ChatMessage[]): {
+  groups: CommGroup[];
+  leftovers: ChatMessage[];
+} {
+  const byCorr = new Map<string, ChatMessage[]>();
+  for (const msg of messages) {
+    const list = byCorr.get(msg.correlation_id) ?? [];
+    list.push(msg);
+    byCorr.set(msg.correlation_id, list);
+  }
+  const groups: CommGroup[] = [];
+  const grouped = new Set<string>();
+  byCorr.forEach((list, corr) => {
+    if (!corr) return;
+    const request =
+      list.find((m: ChatMessage) => m.message_type === "request") ?? null;
+    const response =
+      list.find((m: ChatMessage) => m.message_type === "response") ?? null;
+    if (request && response) {
+      grouped.add(corr);
+      groups.push({
+        correlationId: corr,
+        request,
+        response,
+        others: list.filter((m: ChatMessage) => m !== request && m !== response),
+      });
+    }
+  });
+  return {
+    groups,
+    leftovers: messages.filter((m) => !grouped.has(m.correlation_id)),
+  };
+}
+
+function bestDelivery(msgs: ChatMessage[]): string {
+  const rank = (s: string) =>
+    s === "relayed" ? 0 : s === "sent" ? 1 : s === "stored" ? 2 : 3;
+  const sorted = [...msgs].sort((a, b) => rank(a.status) - rank(b.status));
+  return sorted.length > 0 ? deliveryLabel(sorted[0].status) : "stored";
+}
+
+/** One completed agent-to-agent exchange, collapsed with expandable
+ * details. Only rendered when request + response both exist, so every
+ * checkmark reflects something that actually happened. */
+function CommCard({
+  group,
+  peers,
+  pending,
+  retryingId,
+  onRetry,
+}: {
+  group: CommGroup;
+  peers: { agent_id: string; display_name: string; fingerprint: string }[];
+  pending: boolean;
+  retryingId: string | null;
+  onRetry: (messageId: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const asker = group.request
+    ? peerDisplayName(peers, group.request.sender)
+    : "An agent";
+  const answerer = group.response
+    ? peerDisplayName(peers, group.response.sender)
+    : "A peer agent";
+  const question = group.request ? messageBody(group.request) : "";
+  const answer = group.response ? messageBody(group.response) : "";
+  const delivery = bestDelivery(
+    [group.request, group.response, ...group.others].filter(
+      (m): m is ChatMessage => m !== null
+    )
+  );
+  const failedMsg: ChatMessage | undefined = [
+    group.request,
+    group.response,
+    ...group.others,
+  ].find(
+    (m): m is ChatMessage => m !== null && m.status === "delivery_failed"
+  );
+  return (
+    <li className="rounded-xl border border-line bg-bg-subtle">
+      <div className="px-4 py-3">
+        <p className="text-xs font-semibold uppercase tracking-widest text-ink-3">
+          Agent communication
+        </p>
+        <p className="mt-1 text-sm text-ink">
+          {asker} asked {answerer}
+          {question ? ` — “${question.slice(0, 120)}${question.length > 120 ? "…" : ""}”` : ""}
+        </p>
+        <ul className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-ink-2">
+          <li>
+            <span aria-hidden="true" className="text-emerald-600">✓</span>{" "}
+            {pending ? "Waiting for approval" : "Approved"}
+          </li>
+          <li>
+            <span aria-hidden="true" className="text-emerald-600">✓</span>{" "}
+            {delivery}
+          </li>
+          {answer && (
+            <li>
+              <span aria-hidden="true" className="text-emerald-600">✓</span>{" "}
+              Answer received
+            </li>
+          )}
+        </ul>
+        {answer && !open && (
+          <p className="mt-2 line-clamp-2 text-sm text-ink-2">{answer}</p>
+        )}
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          aria-expanded={open}
+          className="mt-2 text-xs font-medium text-accent hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+        >
+          {open ? "Hide details" : "View details →"}
+        </button>
+      </div>
+      {open && (
+        <div className="space-y-3 border-t border-line px-4 py-3">
+          {[group.request, group.response, ...group.others]
+            .filter((m): m is ChatMessage => m !== null)
+            .map((m) => {
+              const text = messageBody(m);
+              return (
+                <div key={m.message_id} className="space-y-1">
+                  <p className="font-mono text-[11px] uppercase tracking-wide text-ink-3">
+                    {typeLabel(m.message_type)} ({deliveryLabel(m.status)})
+                  </p>
+                  {text ? (
+                    <p className="text-sm text-ink">{text}</p>
+                  ) : (
+                    <p className="text-sm text-ink-2">
+                      {peerDisplayName(peers, m.sender)} →{" "}
+                      {peerDisplayName(peers, m.recipient)}
+                    </p>
+                  )}
+                  <p className="font-mono text-[11px] text-ink-3">
+                    {m.sender} → {m.recipient}
+                  </p>
+                  {m.status === "delivery_failed" && (
+                    <button
+                      type="button"
+                      onClick={() => onRetry(m.message_id)}
+                      disabled={retryingId === m.message_id}
+                      className="inline-flex items-center justify-center rounded-lg border border-amber-200 bg-amber-50 px-3 py-1.5 text-xs font-medium text-amber-800 hover:bg-amber-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/50 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      {retryingId === m.message_id ? "Retrying…" : "Retry delivery"}
+                    </button>
+                  )}
+                </div>
+              );
+            })}
+        </div>
+      )}
+      {failedMsg && !open && (
+        <div className="px-4 pb-3">
+          <button
+            type="button"
+            onClick={() => onRetry(failedMsg.message_id)}
+            disabled={retryingId === failedMsg.message_id}
+            className="inline-flex items-center justify-center rounded-lg border border-amber-200 bg-amber-50 px-3 py-1.5 text-xs font-medium text-amber-800 hover:bg-amber-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/50 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {retryingId === failedMsg.message_id
+              ? "Retrying…"
+              : "Retry delivery"}
+          </button>
+        </div>
+      )}
+    </li>
+  );
+}
+
 type ToAnswer = {
   correlation_id: string;
   requester: string;
@@ -118,6 +296,62 @@ function ErrorState({ message }: { message: string }) {
       {message}
     </p>
   );
+}
+
+function CopyButton({ text, label }: { text: string; label: string }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <button
+      type="button"
+      aria-label={copied ? "Copied" : label}
+      title={copied ? "Copied" : label}
+      onClick={() => {
+        const done = () => {
+          setCopied(true);
+          window.setTimeout(() => setCopied(false), 2000);
+        };
+        try {
+          const result = navigator.clipboard?.writeText(text);
+          if (result && typeof result.then === "function") {
+            result.then(done, () => setCopied(false));
+          } else {
+            done();
+          }
+        } catch {
+          setCopied(false);
+        }
+      }}
+      className="inline-flex items-center gap-1 rounded-md px-1.5 py-1 text-xs text-ink-3 hover:bg-bg-hover hover:text-ink-2 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+    >
+      <svg
+        aria-hidden="true"
+        width="13"
+        height="13"
+        viewBox="0 0 16 16"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.5"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      >
+        <rect x="5" y="5" width="9" height="9" rx="2" />
+        <path d="M11 5V4a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2v5a2 2 0 0 0 2 2h1" />
+      </svg>
+      {copied ? "Copied" : "Copy"}
+    </button>
+  );
+}
+
+function formatTime(createdAt: string): string | null {
+  if (!createdAt) return null;
+  const ts = new Date(createdAt).getTime();
+  if (Number.isNaN(ts)) return null;
+  return new Date(ts).toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
 }
 
 type StreamToolCard = {
@@ -222,25 +456,28 @@ type ThreadTurn = {
   created_at: string;
 };
 
-function EmptyThread() {
+const SUGGESTIONS = [
+  "Research the latest news on a topic I follow",
+  "Explain a complex idea in simple terms",
+  "Draft a polite email for me",
+  "Help me plan my day",
+];
+
+function EmptyThread({ onSuggest }: { onSuggest: (text: string) => void }) {
   return (
     <div className="flex flex-1 flex-col items-center justify-center gap-4 p-8 text-center">
       <p className="text-lg font-medium text-ink">What can I help with?</p>
-      <div className="flex flex-wrap items-center justify-center gap-2">
-        <button
-          type="button"
-          onClick={() => document.getElementById("stream-box")?.focus()}
-          className="inline-flex items-center justify-center rounded-full border border-line bg-bg px-4 py-2 text-sm text-ink-2 hover:bg-bg-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-accent"
-        >
-          Ask live
-        </button>
-        <button
-          type="button"
-          onClick={() => document.getElementById("question-box")?.focus()}
-          className="inline-flex items-center justify-center rounded-full border border-line bg-bg px-4 py-2 text-sm text-ink-2 hover:bg-bg-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-accent"
-        >
-          Ask a peer
-        </button>
+      <div className="flex max-w-md flex-wrap items-center justify-center gap-2">
+        {SUGGESTIONS.map((text) => (
+          <button
+            key={text}
+            type="button"
+            onClick={() => onSuggest(text)}
+            className="inline-flex items-center justify-center rounded-full border border-line bg-bg px-4 py-2 text-sm text-ink-2 hover:bg-bg-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+          >
+            {text}
+          </button>
+        ))}
         <Link
           href="/people"
           className="inline-flex items-center justify-center rounded-full border border-line bg-bg px-4 py-2 text-sm text-ink-2 hover:bg-bg-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-accent"
@@ -309,6 +546,43 @@ function ChatInner() {
     doneText: string;
     citations: string[];
   }>({ tokens: "", doneText: "", citations: [] });
+  const abortRef = useRef<AbortController | null>(null);
+  const nearBottomRef = useRef(true);
+  const [showLatest, setShowLatest] = useState(false);
+
+  useEffect(() => {
+    const onScroll = () => {
+      const distance =
+        document.documentElement.scrollHeight -
+        (window.scrollY + window.innerHeight);
+      nearBottomRef.current = distance < 200;
+      setShowLatest(distance > 500);
+    };
+    window.addEventListener("scroll", onScroll, { passive: true });
+    onScroll();
+    return () => window.removeEventListener("scroll", onScroll);
+  }, []);
+
+  // Stick to the bottom while streaming when the user hasn't scrolled up.
+  useEffect(() => {
+    if (streaming && nearBottomRef.current) {
+      window.scrollTo({
+        top: document.documentElement.scrollHeight,
+        behavior: "auto",
+      });
+    }
+  }, [streamText, streaming]);
+
+  const jumpToLatest = useCallback(() => {
+    window.scrollTo({
+      top: document.documentElement.scrollHeight,
+      behavior: "smooth",
+    });
+  }, []);
+
+  const stopStream = useCallback(() => {
+    abortRef.current?.abort();
+  }, []);
 
   // The URL thread (?t=) is the source of truth: switching history in
   // the sidebar swaps sessions; bare /chat continues (or mints) the
@@ -620,11 +894,16 @@ function ChatInner() {
     setToolCards([]);
     setCitations([]);
     streamAccumRef.current = { tokens: "", doneText: "", citations: [] };
+    const controller = new AbortController();
+    abortRef.current = controller;
     let failed = false;
     try {
       const res = await fetch(
         `${API_BASE}/chat/stream?message=${encodeURIComponent(prompt)}&session_id=${encodeURIComponent(sessionId)}&agent=${encodeURIComponent(agentHandle)}`,
-        { headers: { Accept: "text/event-stream", ...authHeaders() } }
+        {
+          headers: { Accept: "text/event-stream", ...authHeaders() },
+          signal: controller.signal,
+        }
       );
       if (!res.ok || !res.body) {
         const body = (await res.json().catch(() => ({}))) as {
@@ -692,9 +971,15 @@ function ChatInner() {
         }
       }
     } catch (err) {
-      failed = true;
-      setStreamError(err instanceof Error ? err.message : "Stream failed.");
+      if (controller.signal.aborted) {
+        // Stopped by the user: keep the partial text, no error banner.
+        failed = false;
+      } else {
+        failed = true;
+        setStreamError(err instanceof Error ? err.message : "Stream failed.");
+      }
     } finally {
+      if (abortRef.current === controller) abortRef.current = null;
       setStreaming(false);
       // Fold the finished turn into local history (the server persisted
       // the same rows): the thread reads as one conversation and the
@@ -724,6 +1009,10 @@ function ChatInner() {
   }, [streamInput, streaming, sessionId, agentHandle]);
 
   const selectedPeer = peers.find((p) => p.agent_id === peerId) ?? null;
+  const { groups: commGroups, leftovers: leftoverMessages } = useMemo(
+    () => groupCompletedExchanges(messages),
+    [messages]
+  );
   const pendingCount = cards.length;
   const cardsByCorrelation = new Map<string, ApprovalCard[]>();
   for (const card of cards) {
@@ -863,7 +1152,12 @@ function ChatInner() {
                   <ListSkeleton />
                 </div>
               ) : (
-                <EmptyThread />
+                <EmptyThread
+                  onSuggest={(text) => {
+                    setStreamInput(text);
+                    document.getElementById("stream-box")?.focus();
+                  }}
+                />
               )
             ) : (
               <ul className="flex-1 space-y-6">
@@ -908,6 +1202,14 @@ function ChatInner() {
                     <article className="space-y-2">
                       <SafeMarkdown text={turn.text} />
                     </article>
+                    <div className="flex items-center gap-2">
+                      <CopyButton text={turn.text} label="Copy response" />
+                      {formatTime(turn.created_at) && (
+                        <time className="text-xs text-ink-3">
+                          {formatTime(turn.created_at)}
+                        </time>
+                      )}
+                    </div>
                     {turn.citations.length > 0 && (
                       <ul
                         aria-label="Sources"
@@ -932,7 +1234,19 @@ function ChatInner() {
               )
             )}
 
-            {messages.map((msg) => {
+            {commGroups.map((group) => (
+              <CommCard
+                key={group.correlationId}
+                group={group}
+                peers={peers}
+                pending={
+                  (cardsByCorrelation.get(group.correlationId) ?? []).length > 0
+                }
+                retryingId={retrying}
+                onRetry={(id) => void retryDelivery(id)}
+              />
+            ))}
+            {leftoverMessages.map((msg) => {
               const isRequest = msg.message_type === "request";
               const body = messageBody(msg);
               const inlineCards =
@@ -1282,14 +1596,23 @@ function ChatInner() {
                 <button
                   type="submit"
                   disabled={
-                    streaming || askBusy || streamInput.trim().length === 0
+                    (!streaming && askBusy) ||
+                    (!streaming && streamInput.trim().length === 0)
                   }
+                  aria-label={streaming ? "Stop generation" : "Ask live"}
+                  onClick={(e) => {
+                    if (streaming) {
+                      e.preventDefault();
+                      stopStream();
+                    }
+                  }}
                   className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-accent text-white hover:bg-accent-d focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/50 disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   {streaming ? (
-                    <span aria-hidden="true" className="text-sm leading-none">
-                      …
-                    </span>
+                    <span
+                      aria-hidden="true"
+                      className="block h-3 w-3 rounded-[2px] bg-white"
+                    />
                   ) : (
                     <svg
                       aria-hidden="true"
@@ -1306,9 +1629,6 @@ function ChatInner() {
                       <polyline points="3 7 8 2 13 7" />
                     </svg>
                   )}
-                  <span className="sr-only">
-                    {streaming ? "Streaming…" : "Ask live"}
-                  </span>
                 </button>
               </form>
             </section>
@@ -1387,6 +1707,29 @@ function ChatInner() {
             </section>
           </div>
         </footer>
+        {showLatest && (
+          <button
+            type="button"
+            onClick={jumpToLatest}
+            aria-label="Jump to latest messages"
+            className="fixed bottom-40 right-4 z-30 inline-flex h-9 w-9 items-center justify-center rounded-full border border-line bg-bg text-ink-2 shadow-md hover:bg-bg-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+          >
+            <svg
+              aria-hidden="true"
+              width="16"
+              height="16"
+              viewBox="0 0 16 16"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <line x1="8" y1="2" x2="8" y2="14" />
+              <polyline points="3 9 8 14 13 9" />
+            </svg>
+          </button>
+        )}
       </div>
     </div>
   );

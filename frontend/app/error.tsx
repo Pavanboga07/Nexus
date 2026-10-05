@@ -35,10 +35,10 @@ export default function RouteError({
           Try again
         </button>
         <a
-          href="/"
+          href="/chat"
           className="inline-flex items-center justify-center rounded-lg border border-line bg-bg px-4 py-2 text-sm font-medium text-ink-2 hover:bg-bg-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-ink-3/50"
         >
-          Dashboard
+          Back to chat
         </a>
       </div>
     </main>
