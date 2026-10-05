@@ -161,6 +161,34 @@ def approve_route(
         return _error(exc)
 
 
+@router.get("/me")
+def my_identity_route(conn: sqlite3.Connection = Depends(get_conn)):
+    """Local identity card: agent_id, public key, fingerprint.
+
+    503 ``NO_IDENTITY`` when no machine secret is configured or the
+    stored key is corrupt — same shape as the other identity faults.
+    """
+    from app.identity.service import IdentityCorruptionError, ensure_identity
+    from app.machine_config import MachineConfigError, get_or_create_identity_secret
+
+    try:
+        try:
+            secret = get_or_create_identity_secret()
+        except MachineConfigError as exc:
+            raise PairingError("NO_IDENTITY", str(exc), status=503) from exc
+        try:
+            view = ensure_identity(conn, secret)
+        except IdentityCorruptionError as exc:
+            raise PairingError("NO_IDENTITY", str(exc), status=503) from exc
+        return {
+            "agent_id": view.agent_id,
+            "public_key": view.public_key,
+            "fingerprint": view.fingerprint,
+        }
+    except PairingError as exc:
+        return _error(exc)
+
+
 @router.get("/peers")
 def peers_route(conn: sqlite3.Connection = Depends(get_conn)):
     return {"peers": pairing.list_peers(conn)}
@@ -170,6 +198,42 @@ def peers_route(conn: sqlite3.Connection = Depends(get_conn)):
 def unpair_route(agent_id: str, conn: sqlite3.Connection = Depends(get_conn)):
     # Local-only by design: works with the peer unreachable.
     return {"agent_id": agent_id, "removed": pairing.unpair(conn, agent_id)}
+
+
+class TrustIn(BaseModel):
+    state: str = ""
+
+
+@router.get("/directory/lookup")
+def directory_lookup_route(agent_id: str):
+    """Fetch + verify one gateway directory card (discovery metadata).
+
+    Verified cards only — anything failing verification is rejected,
+    never trusted. Pairing still requires the invite ceremony.
+    """
+    from app import remote_directory
+
+    try:
+        return {"card": remote_directory.fetch_card(agent_id)}
+    except remote_directory.DirectoryError as exc:
+        return JSONResponse(
+            status_code=exc.status or 502,
+            content={"detail": str(exc), "code": exc.code},
+        )
+
+
+@router.post("/peers/{agent_id}/trust")
+def set_trust_route(agent_id: str, body: TrustIn,
+                    conn: sqlite3.Connection = Depends(get_conn)):
+    """Move a peer through TRUSTED → SUSPENDED → REVOKED.
+
+    Suspended peers exchange nothing new (history kept); revoked peers
+    additionally fail delegation verification. Unpair deletes the row.
+    """
+    try:
+        return pairing.set_peer_trust(conn, agent_id, body.state)
+    except pairing.PairingError as exc:
+        return _error(exc)
 
 
 __all__ = ["router"]

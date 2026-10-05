@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 
 import pytest
 from fastapi.testclient import TestClient
+from tests.conftest import auth_headers
 
 NOW = datetime(2026, 9, 22, 12, 0, 0, tzinfo=timezone.utc)
 NOW_ISO = "2026-09-22T12:00:00Z"
@@ -514,14 +515,17 @@ def test_two_profile_exchange_approvals_both_ends_via_relay(
         conn_b, req, signer_priv=priv_b, local_id=ident_b.agent_id, now=NOW
     )
     assert parked["outcome"] == "parked"
+    # Decided in real time: this envelope crosses the relay, whose
+    # queue enforces expiry against the wall clock (frozen NOW would
+    # arrive already expired).
     approval = service.approve_approval(
         conn_b, parked["approval"]["approval_id"],
-        signer_priv=priv_b, local_id=ident_b.agent_id, now=NOW,
+        signer_priv=priv_b, local_id=ident_b.agent_id,
     )
     _relay_hop(Session, approval)
+    # Validated in real time to match the envelope's real stamp.
     seen = service.receive_envelope(
         conn_a, approval, signer_priv=priv_a, local_id=ident_a.agent_id,
-        now=NOW,
     )
     assert seen["outcome"] == "resolved"
     resp = service.send_response(
@@ -548,14 +552,14 @@ def test_two_profile_exchange_approvals_both_ends_via_relay(
         conn_a, req2, signer_priv=priv_a, local_id=ident_a.agent_id, now=NOW
     )
     assert parked2["outcome"] == "parked"
+    # Real time again: this envelope crosses the real-clock relay.
     approval2 = service.approve_approval(
         conn_a, parked2["approval"]["approval_id"],
-        signer_priv=priv_a, local_id=ident_a.agent_id, now=NOW,
+        signer_priv=priv_a, local_id=ident_a.agent_id,
     )
     _relay_hop(Session, approval2)
     assert service.receive_envelope(
         conn_b, approval2, signer_priv=priv_b, local_id=ident_b.agent_id,
-        now=NOW,
     )["outcome"] == "resolved"
     resp2 = service.send_response(
         conn_a, signer_priv=priv_a, sender_id=ident_a.agent_id,
@@ -584,7 +588,7 @@ def _ask_client(tmp_path, monkeypatch, name="r"):
     monkeypatch.setenv("NEXUS_DB_PATH", db_path)
     monkeypatch.setenv("NEXUS_IDENTITY_KEY", secret)
     monkeypatch.delenv("NEXUS_RELAY_URL", raising=False)
-    return TestClient(app)
+    return TestClient(app, headers=auth_headers())
 
 
 def _route_peer(client, display_name="Blaise"):

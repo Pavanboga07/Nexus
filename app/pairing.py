@@ -356,21 +356,101 @@ def approve_peer(
     }
 
 
-def list_peers(conn: sqlite3.Connection) -> list[dict[str, Any]]:
-    rows = conn.execute(
-        "SELECT agent_id, public_key, display_name, fingerprint, paired_at "
-        "FROM paired_peers ORDER BY agent_id ASC"
-    ).fetchall()
-    return [dict(row) for row in rows]
+def list_peers(conn: sqlite3.Connection, now: str = "") -> list[dict[str, Any]]:
+    """Peers with trust state, last-seen, and derived liveness.
+
+    ``online`` means seen in the last 15 minutes. Liveness is
+    informational only: ONLINE never implies TRUSTED, and TRUSTED
+    never implies online.
+    """
+    import datetime
+
+    at = now or datetime.datetime.now(
+        datetime.timezone.utc).isoformat()
+    out = []
+    for row in conn.execute(
+        "SELECT agent_id, public_key, display_name, fingerprint, paired_at,"
+        " trust_state, last_seen_at FROM paired_peers ORDER BY agent_id ASC"
+    ).fetchall():
+        peer = dict(row)
+        seen = peer.get("last_seen_at") or ""
+        peer["online"] = bool(seen) and seen > _fifteen_minutes_ago(at)
+        out.append(peer)
+    return out
+
+
+def _fifteen_minutes_ago(at: str) -> str:
+    import datetime
+
+    try:
+        moment = datetime.datetime.fromisoformat(at)
+    except ValueError:
+        return "9999"
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=datetime.timezone.utc)
+    return (moment - datetime.timedelta(minutes=15)).isoformat()
 
 
 def get_peer(conn: sqlite3.Connection, agent_id: str) -> dict[str, Any] | None:
     row = conn.execute(
-        "SELECT agent_id, public_key, display_name, fingerprint, paired_at "
-        "FROM paired_peers WHERE agent_id = ?",
+        "SELECT agent_id, public_key, display_name, fingerprint, paired_at,"
+        " trust_state, last_seen_at FROM paired_peers WHERE agent_id = ?",
         (agent_id,),
     ).fetchone()
     return dict(row) if row is not None else None
+
+
+#: Peer trust lifecycle: TRUSTED exchanges work; SUSPENDED parks all
+#: new sends/receives but keeps history; REVOKED additionally fails
+#: delegation verification (unpair deletes the row entirely).
+PEER_TRUST_STATES = ("TRUSTED", "SUSPENDED", "REVOKED")
+
+
+def set_peer_trust(conn: sqlite3.Connection, agent_id: str,
+                   state: str) -> dict[str, Any]:
+    """Move a paired peer through its trust lifecycle."""
+    if state not in PEER_TRUST_STATES:
+        raise PairingError(
+            "BAD_TRUST_STATE",
+            f"trust must be one of {list(PEER_TRUST_STATES)}.",
+            status=400,
+        )
+    with conn:
+        cur = conn.execute(
+            "UPDATE paired_peers SET trust_state = ? WHERE agent_id = ?",
+            (state, agent_id),
+        )
+        if cur.rowcount == 0:
+            raise PairingError(
+                "NOT_PAIRED", f"unknown peer {agent_id!r}.", status=404
+            )
+    try:
+        from app import autonomy as autonomy_mod
+
+        autonomy_mod.emit_event(
+            conn, f"peer.{state.lower()}",
+            {"agent_id": agent_id},
+            agent_id="",
+        )
+    except Exception:
+        pass
+    peer = get_peer(conn, agent_id)
+    assert peer is not None
+    return peer
+
+
+def touch_peer_seen(conn: sqlite3.Connection, agent_id: str,
+                    now: str) -> None:
+    """Best-effort last-seen bump for an authenticated ingest."""
+    try:
+        with conn:
+            conn.execute(
+                "UPDATE paired_peers SET last_seen_at = ?"
+                " WHERE agent_id = ?",
+                (now, agent_id),
+            )
+    except sqlite3.Error:
+        pass
 
 
 def unpair(conn: sqlite3.Connection, agent_id: str) -> bool:

@@ -18,6 +18,7 @@ import pytest
 
 from app.memory.extract import extract_facts, queue_extraction, record_turn
 from app.memory.store import MemoryStore
+from tests.conftest import auth_headers
 
 
 @pytest.fixture()
@@ -168,7 +169,7 @@ def _client(db_path, monkeypatch):
     monkeypatch.setenv("NEXUS_DB_PATH", db_path)
     from fastapi.testclient import TestClient
 
-    return TestClient(app)
+    return TestClient(app, headers=auth_headers())
 
 
 def test_memory_api_search_forget_export_import(tmp_path, monkeypatch):
@@ -228,7 +229,7 @@ def test_chat_stream_extracts_without_breaking(tmp_path, monkeypatch):
     from app.main import app
     from fastapi.testclient import TestClient
 
-    client = TestClient(app)
+    client = TestClient(app, headers=auth_headers())
     # The user turn carries a fact; extraction must not break the stream.
     with client.stream(
         "GET",

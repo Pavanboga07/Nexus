@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import pytest
 from fastapi.testclient import TestClient
+from tests.conftest import auth_headers
 
 
 def _seed_local_profile(tmp_path, monkeypatch, name="inviter"):
@@ -59,7 +60,7 @@ def test_invite_succeeds_with_no_card_in_body(relay_engine, tmp_path, monkeypatc
             pairing, "http_publish_transport",
             lambda base_url: _relay_publish_transport(relay),
         )
-        client = TestClient(app)
+        client = TestClient(app, headers=auth_headers())
         # Primary path: NO card in the body at all.
         resp = client.post("/pairing/invites", json={})
         assert resp.status_code == 200, resp.text
@@ -94,7 +95,7 @@ def test_invite_no_card_fingerprint_equality_both_sides(
             pairing, "http_publish_transport",
             lambda base_url: _relay_publish_transport(relay),
         )
-        client = TestClient(app)
+        client = TestClient(app, headers=auth_headers())
         resp = client.post(
             "/pairing/invites", json={"display_name": "Ada"}
         )
@@ -143,7 +144,7 @@ def test_invite_mismatched_card_still_403(tmp_path, monkeypatch):
             "expires_at": utc_iso_in(365 * 24 * 3600),
         },
     )
-    client = TestClient(app)
+    client = TestClient(app, headers=auth_headers())
     resp = client.post("/pairing/invites", json={"card": foreign})
     assert resp.status_code == 403
     assert resp.json()["code"] == "NOT_LOCAL_CARD"
@@ -155,7 +156,7 @@ def test_invite_empty_card_object_is_rejected(tmp_path, monkeypatch):
 
     _seed_local_profile(tmp_path, monkeypatch)
     monkeypatch.delenv("NEXUS_RELAY_URL", raising=False)
-    client = TestClient(app)
+    client = TestClient(app, headers=auth_headers())
     resp = client.post("/pairing/invites", json={"card": {}})
     assert resp.status_code == 403
     assert resp.json()["code"] == "NOT_LOCAL_CARD"

@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
+from tests.conftest import auth_headers
 
 NOW = datetime(2026, 9, 22, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -390,7 +391,7 @@ def _route_client(tmp_path, monkeypatch):
 
     monkeypatch.setenv("NEXUS_DB_PATH", str(tmp_path / "routes.db"))
     monkeypatch.delenv("NEXUS_RELAY_URL", raising=False)
-    return TestClient(app)
+    return TestClient(app, headers=auth_headers())
 
 
 def test_routes_peers_empty_and_unpair_unknown(tmp_path, monkeypatch):

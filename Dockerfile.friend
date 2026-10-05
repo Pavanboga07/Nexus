@@ -43,7 +43,7 @@ ENV NEXUS_DB_PATH=/data/nexus.db
 # Gemini-compatible provider + shared relay. The model KEY itself is
 # pasted in the UI, never passed at `docker run`.
 ENV NEXUS_LLM_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai/
-ENV NEXUS_LLM_MODEL=gemini-3.6-flash
+ENV NEXUS_LLM_MODEL=gemini-3.8-flash
 ENV NEXUS_RELAY_URL=wss://nexus-gateway-mv63.onrender.com
 
 EXPOSE 8001 3001

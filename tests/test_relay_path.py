@@ -20,6 +20,7 @@ import threading
 
 import pytest
 from fastapi.testclient import TestClient
+from tests.conftest import auth_headers
 
 LIVE_EXP = "2027-09-22T12:05:00Z"
 NOW_ISO = "2026-09-22T12:00:00Z"
@@ -372,16 +373,19 @@ def test_two_profile_ask_approve_answer_over_relay_sockets(
                 assert parked["outcome"] == "parked"
 
                 # B approves; the approve travels back over the socket.
+                # Decided in real time: the relay validates expiry against
+                # the wall clock (a frozen stamp would arrive expired).
                 approval = service.approve_approval(
                     conn_b, parked["approval"]["approval_id"],
-                    signer_priv=priv_b, local_id=ident_b.agent_id, now=NOW_ISO,
+                    signer_priv=priv_b, local_id=ident_b.agent_id,
                 )
                 seen = _deliver_and_ack(
                     ws_b, approval, ident_a.agent_id, "relay_apr001", ws_a
                 )
+                # Real-time validation to match the real-stamped approve.
                 assert service.receive_envelope(
                     conn_a, seen, signer_priv=priv_a,
-                    local_id=ident_a.agent_id, now=NOW_ISO,
+                    local_id=ident_a.agent_id,
                 )["outcome"] == "resolved"
 
                 # B answers; the response travels over the socket.
@@ -421,7 +425,7 @@ def _ask_client(tmp_path, monkeypatch, name="r2", relay_url=None):
         monkeypatch.delenv("NEXUS_RELAY_URL", raising=False)
     else:
         monkeypatch.setenv("NEXUS_RELAY_URL", relay_url)
-    return TestClient(app)
+    return TestClient(app, headers=auth_headers())
 
 
 def _route_peer(client, display_name="Blaise"):
@@ -575,7 +579,7 @@ def _live_client(tmp_path, monkeypatch, name="live"):
     monkeypatch.setenv("NEXUS_DB_PATH", db_path)
     monkeypatch.setenv("NEXUS_IDENTITY_KEY", secret)
     monkeypatch.setenv("NEXUS_RELAY_URL", "http://relay.test")
-    return TestClient(app)
+    return TestClient(app, headers=auth_headers())
 
 
 def test_live_bridge_forwards_delivery_and_acks(tmp_path, monkeypatch):
@@ -634,7 +638,8 @@ def test_live_bridge_forwards_delivery_and_acks(tmp_path, monkeypatch):
         return FakeRelay()
 
     monkeypatch.setattr(ask_route.relay_client, "connect", _fake_connect)
-    with client.websocket_connect("/ask/live") as ws:
+    ticket = client.post("/ask/live-ticket").json()["ticket"]
+    with client.websocket_connect(f"/ask/live?ticket={ticket}") as ws:
         ready = ws.receive_json()
         assert ready["type"] == "ready"
         notice = ws.receive_json()
@@ -774,7 +779,8 @@ def test_live_bridge_tears_down_when_relay_drops(tmp_path, monkeypatch):
         return DroppingRelay()
 
     monkeypatch.setattr(ask_route.relay_client, "connect", _fake_connect)
-    with client.websocket_connect("/ask/live") as ws:
+    ticket = client.post("/ask/live-ticket").json()["ticket"]
+    with client.websocket_connect(f"/ask/live?ticket={ticket}") as ws:
         assert ws.receive_json()["type"] == "ready"
         notice = ws.receive_json()
         assert notice["type"] == "delivery"

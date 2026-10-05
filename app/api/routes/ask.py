@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import sqlite3
 from typing import Any
@@ -18,6 +19,7 @@ from fastapi import (
     APIRouter,
     BackgroundTasks,
     Depends,
+    Request,
     WebSocket,
     WebSocketDisconnect,
 )
@@ -50,6 +52,7 @@ class RuleIn(BaseModel):
     data_category: str = "*"
     purpose: str = "*"
     action: str = "*"
+    agent: str | None = None
 
 
 class RejectIn(BaseModel):
@@ -123,16 +126,19 @@ def _local_key(conn: sqlite3.Connection):
     return crypto.load_private_key(private_raw), view.agent_id
 
 
-def _relay_ws_url(base: str) -> str:
-    """HTTP(S) relay base -> ``ws(s)://.../ws`` (ws(s) passthrough)."""
-    base = base.strip().rstrip("/")
-    if base.startswith("https://"):
-        base = "wss://" + base[len("https://"):]
-    elif base.startswith("http://"):
-        base = "ws://" + base[len("http://"):]
-    if not base.endswith("/ws"):
-        base += "/ws"
-    return base
+# Shared relay delivery lives in app/dispatch.py (orchestrated
+# dispatches reuse the exact same path). These aliases keep existing
+# imports — including tests — working unchanged.
+from app.dispatch import (
+    QUEUED_DELIVERY,
+    deliver_envelope as _background_deliver,
+)
+from app.dispatch import (
+    queue_delivery as _queue_delivery,
+)
+from app.dispatch import (
+    relay_ws_url as _relay_ws_url,
+)
 
 
 def _local_pubkey(conn: sqlite3.Connection) -> str:
@@ -140,75 +146,6 @@ def _local_pubkey(conn: sqlite3.Connection) -> str:
         "SELECT public_key FROM identity WHERE id = 1"
     ).fetchone()
     return str(row["public_key"]) if row is not None else ""
-
-
-QUEUED_DELIVERY = {
-    "mode": "queued",
-    "reason": "delivering in background; refresh to confirm",
-}
-
-
-async def _background_deliver(
-    message_id: str, envelope: dict, db_path: str
-) -> None:
-    """Deliver one stored envelope; flip its row to relayed/failed.
-
-    Opens a FRESH connection (never the request ``conn``) so the HTTP
-    request never waits on the relay handshake. Ack -> ``relayed``;
-    any exception -> ``delivery_failed`` (both readable via
-    ``GET /ask/messages``).
-    """
-    from app.store import migrate, open_db
-
-    conn = open_db(db_path)
-    migrate(conn)
-    try:
-        try:
-            from app.identity import crypto
-
-            base = os.environ.get("NEXUS_RELAY_URL", "").strip()
-            priv, agent_id = _local_key(conn)
-            await relay_client.deliver_one(
-                _relay_ws_url(base),
-                envelope,
-                recipient=envelope["recipient"],
-                agent_id=agent_id,
-                public_key_b64=_local_pubkey(conn),
-                sign_fn=lambda data: crypto.sign_bytes(priv, data),
-                timeout=relay_client.CONNECT_TIMEOUT,
-                ack_timeout=relay_client.ACK_TIMEOUT,
-            )
-            status = "relayed"
-        except Exception:  # noqa: BLE001 - failure is a row state
-            status = "delivery_failed"
-        with conn:
-            conn.execute(
-                "UPDATE a2a_messages SET status = ? WHERE message_id = ?",
-                (status, message_id),
-            )
-    finally:
-        conn.close()
-
-
-def _queue_delivery(
-    background: BackgroundTasks, signed: dict, db_path: str
-) -> dict:
-    """Return immediately; deliver in the background when configured.
-
-    No relay URL -> ``local-only`` (nothing to send to). Otherwise the
-    response is ``queued`` and ``_background_deliver`` flips the stored
-    row to ``relayed`` / ``delivery_failed`` for polling.
-    """
-    base = os.environ.get("NEXUS_RELAY_URL", "").strip()
-    if not base:
-        return {
-            "mode": "local-only",
-            "reason": "relay is not configured (set NEXUS_RELAY_URL).",
-        }
-    background.add_task(
-        _background_deliver, signed["message_id"], signed, db_path
-    )
-    return dict(QUEUED_DELIVERY)
 
 
 @router.post("")
@@ -302,6 +239,22 @@ async def approve_route(approval_id: str, background: BackgroundTasks):
         signed = service.approve_approval(
             conn, approval_id, signer_priv=priv, local_id=agent_id
         )
+        try:
+            from app import autonomy as autonomy_mod
+
+            row = conn.execute(
+                "SELECT correlation_id FROM a2a_approvals"
+                " WHERE approval_id = ?",
+                (approval_id,),
+            ).fetchone()
+            autonomy_mod.emit_event(
+                conn, "approval.approved",
+                {"approval_id": approval_id,
+                 "correlation_id": row["correlation_id"]
+                 if row is not None else ""},
+            )
+        except Exception:
+            pass
         return {
             "approval_id": approval_id,
             "status": "approved",
@@ -334,6 +287,15 @@ async def reject_route(
             local_id=agent_id,
             reason=(body.reason if body else "declined by approver"),
         )
+        try:
+            from app import autonomy as autonomy_mod
+
+            autonomy_mod.emit_event(
+                conn, "approval.rejected",
+                {"approval_id": approval_id},
+            )
+        except Exception:
+            pass
         return {
             "approval_id": approval_id,
             "status": "rejected",
@@ -403,6 +365,7 @@ def policy_create_route(
             data_category=body.data_category,
             purpose=body.purpose,
             action=body.action,
+            agent=body.agent,
         )
     except A2AError as exc:
         return _error(exc)
@@ -444,6 +407,11 @@ async def _pump_relay_deliveries(browser: WebSocket, relay_ws: Any) -> None:
                 )
             except A2AError as exc:
                 outcome = {"outcome": "error", "code": exc.code}
+                logging.getLogger("nexus.ingest").warning(
+                    "delivery ingest rejected: %s (relay_id=%s)",
+                    exc.code,
+                    frame.get("relay_id", ""),
+                )
             try:
                 await relay_client.ack_delivery(
                     relay_ws, frame.get("relay_id", "")
@@ -469,15 +437,50 @@ async def _pump_relay_deliveries(browser: WebSocket, relay_ws: Any) -> None:
         conn.close()
 
 
+@router.post("/live-ticket")
+def live_ticket_route(request: Request):
+    """Mint a single-use ticket for the browser live bridge (this route
+    itself is bearer-authed by the middleware).
+
+    MVP rate limit: 30 tickets per minute per client.
+    """
+    from app.auth import issue_live_ticket
+    from app.ratelimit import check_rate_limit
+
+    client = "unknown"
+    try:
+        fwd = (request.headers.get("x-forwarded-for", "") or "").split(",")[0].strip()
+        client = fwd or (request.client.host if request.client else "unknown")
+    except Exception:
+        client = "unknown"
+    allowed, retry = check_rate_limit(f"live-ticket:{client}", limit=30, window_seconds=60)
+    if not allowed:
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "Too many ticket requests. Try again later.", "code": "RATE_LIMITED"},
+            headers={"Retry-After": str(retry)},
+        )
+    return {"ticket": issue_live_ticket()}
+
+
 @router.websocket("/live")
 async def live_bridge(browser: WebSocket):
     """Chat's live socket: holds ONE relay connection for this browser.
 
-    Signed relay handshake with the local key; relay-auth failure closes
-    this socket with 4401 too. Relay ``delivery`` frames are ingested,
-    acked, and forwarded so approvals/decide refresh from live traffic.
+    Browsers cannot send Authorization on the handshake, so auth is a
+    single-use ``?ticket=`` minted at ``POST /ask/live-ticket`` (the
+    auth middleware never sees websocket scopes — enforced here with
+    4401). Signed relay handshake with the local key; relay-auth failure
+    closes this socket with 4401 too. Relay ``delivery`` frames are
+    ingested, acked, and forwarded so approvals/decide refresh from
+    live traffic.
     """
     await browser.accept()
+    from app.auth import redeem_live_ticket
+
+    if not redeem_live_ticket(browser.query_params.get("ticket", "")):
+        await browser.close(code=relay_client.WS_CLOSE_UNAUTHORIZED)
+        return
     from app.store import migrate, open_db
 
     path = os.environ.get("NEXUS_DB_PATH", "data/nexus.db")
@@ -496,7 +499,9 @@ async def live_bridge(browser: WebSocket):
         return
     conn.close()
     if not base:
-        await browser.close(code=relay_client.WS_CLOSE_UNAUTHORIZED)
+        # No relay configured: a relay-side problem (1011), not an
+        # authentication failure — 4401 would blame the credentials.
+        await browser.close(code=1011)
         return
     try:
         relay_ws = await relay_client.connect(

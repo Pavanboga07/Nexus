@@ -22,6 +22,7 @@ import threading
 import time
 
 from fastapi.testclient import TestClient
+from tests.conftest import auth_headers
 
 LIVE_EXP = "2027-09-22T12:05:00Z"
 NOW_ISO = "2026-09-22T12:00:00Z"
@@ -89,7 +90,7 @@ def _ask_client(tmp_path, monkeypatch, name="bg", relay_url=None):
         monkeypatch.delenv("NEXUS_RELAY_URL", raising=False)
     else:
         monkeypatch.setenv("NEXUS_RELAY_URL", relay_url)
-    return TestClient(app)
+    return TestClient(app, headers=auth_headers())
 
 
 def _route_peer(client, display_name="Blaise"):

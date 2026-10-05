@@ -107,11 +107,17 @@ class LLMConfig:
 def get_llm_config() -> LLMConfig:
     """Read the machine-local model config. Raises MissingKeyError.
 
-    Resolution order: stored file key (settings UI) -> NEXUS_LLM_API_KEY
-    env -> missing. The stored key applies without a restart (resolved
-    per turn, no cache).
+    Key resolution order: stored file key (settings UI) ->
+    NEXUS_LLM_API_KEY env -> missing. Base URL and model resolve
+    stored file value -> NEXUS_LLM_BASE_URL / NEXUS_LLM_MODEL env ->
+    built-in OpenAI default. Everything applies without a restart
+    (resolved per turn, no cache).
     """
-    from app.machine_config import resolve_llm_key
+    from app.machine_config import (
+        resolve_llm_base_url,
+        resolve_llm_key,
+        resolve_llm_model,
+    )
 
     api_key = (resolve_llm_key() or "").strip()
     if not api_key:
@@ -120,12 +126,11 @@ def get_llm_config() -> LLMConfig:
             "the UI (Chat settings) or set NEXUS_LLM_API_KEY before "
             "using /chat/stream."
         )
-    base_url = (
-        os.environ.get("NEXUS_LLM_BASE_URL", "").strip()
-        or "https://api.openai.com/v1"
-    ).rstrip("/")
-    model = os.environ.get("NEXUS_LLM_MODEL", "").strip() or "gpt-4o-mini"
-    return LLMConfig(api_key=api_key, base_url=base_url, model=model)
+    return LLMConfig(
+        api_key=api_key,
+        base_url=resolve_llm_base_url(),
+        model=resolve_llm_model(),
+    )
 
 
 def escape_retrieved(text: str) -> str:

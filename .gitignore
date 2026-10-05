@@ -1,5 +1,10 @@
 .env
+.env.*
 *.db*
+data/
+data-friend/
+machine.json
+operator_token
 __pycache__/
 .pytest_cache/
 node_modules/

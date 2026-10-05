@@ -16,6 +16,7 @@ import json
 
 import pytest
 from fastapi.testclient import TestClient
+from tests.conftest import auth_headers
 
 DEAD_END_TEXT = "couldn't put together an answer"
 
@@ -396,7 +397,7 @@ def test_sse_endpoint_streams_tool_cards_and_done(monkeypatch):
     )
     monkeypatch.setattr(chat_route, "build_tools", lambda: {})
 
-    client = TestClient(app)
+    client = TestClient(app, headers=auth_headers())
     with client.stream(
         "GET", "/chat/stream", params={"message": "hi"}
     ) as response:
@@ -423,7 +424,7 @@ def test_sse_endpoint_missing_key_is_503(monkeypatch):
         )
 
     monkeypatch.setattr(chat_route, "build_provider", _boom)
-    client = TestClient(app)
+    client = TestClient(app, headers=auth_headers())
     response = client.get("/chat/stream", params={"message": "hi"})
     assert response.status_code == 503
     assert response.json()["code"] == "MISSING_KEY"

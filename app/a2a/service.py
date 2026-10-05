@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from pydantic import ValidationError
@@ -77,16 +77,30 @@ def evaluate_policy(
     data_category: str,
     purpose: str,
     action: str,
+    agent: str | None = None,
 ) -> str:
     """ALLOW when a rule matches (most specific wins), DENY when the
-    category is sensitive, ASK otherwise (fail-closed default)."""
+    category is sensitive, ASK otherwise (fail-closed default).
+
+    ``agent`` scopes evaluation to one local agent: rules with
+    ``agent_id`` ``'*'`` apply to every agent, rules naming an agent
+    apply only to it. ``None`` (e.g. the identity-level A2A receive
+    path) sees global rules only, preserving legacy behavior exactly.
+    Sensitive-category DENY ignores rules entirely, whatever the agent.
+    """
     if data_category in SENSITIVE_CATEGORIES:
         return "DENY"
     best: int | None = None
     for row in conn.execute(
-        "SELECT peer, data_category, purpose, action, effect "
+        "SELECT peer, data_category, purpose, action, effect, agent_id "
         "FROM policy_rules WHERE effect = 'ALLOW'"
     ).fetchall():
+        rule_agent = row["agent_id"] if "agent_id" in row.keys() else "*"
+        if agent is None:
+            if rule_agent != "*":
+                continue
+        elif rule_agent != "*" and rule_agent != agent:
+            continue
         fields = (
             (row["peer"], peer),
             (row["data_category"], data_category),
@@ -96,6 +110,8 @@ def evaluate_policy(
         if any(rule != "*" and rule != got for rule, got in fields):
             continue
         score = sum(1 for rule, _ in fields if rule != "*")
+        if rule_agent != "*":
+            score += 1
         if best is None or score > best:
             best = score
     return "ALLOW" if best is not None else "ASK"
@@ -109,9 +125,14 @@ def create_rule(
     purpose: str = "*",
     action: str = "*",
     effect: str = "ALLOW",
+    agent: str | None = None,
     now: datetime | str | None = None,
 ) -> dict[str, Any]:
-    """Store a user-created ALLOW rule (the only effect in v1)."""
+    """Store a user-created ALLOW rule (the only effect in v1).
+
+    ``agent`` scopes the rule to one local agent; ``'*'`` (default)
+    keeps it global. Empty agent names are rejected fail-closed.
+    """
     if effect != "ALLOW":
         raise A2AError(
             "INVALID_RULE",
@@ -119,15 +140,23 @@ def create_rule(
             "sensitive categories).",
             status=400,
         )
+    if agent is None:
+        owner = "*"
+    else:
+        owner = agent.strip()
+        if not owner:
+            raise A2AError(
+                "INVALID_RULE", "agent must not be empty.", status=400
+            )
     rule_id = _new_id("rule")
     created_at = _now_iso(now)
     with conn:
         conn.execute(
             "INSERT INTO policy_rules "
             "(rule_id, peer, data_category, purpose, action, effect, "
-            "created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "agent_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (rule_id, peer, data_category, purpose, action, effect,
-             created_at),
+             owner, created_at),
         )
     return {
         "rule_id": rule_id,
@@ -136,6 +165,7 @@ def create_rule(
         "purpose": purpose,
         "action": action,
         "effect": effect,
+        "agent_id": owner,
         "created_at": created_at,
     }
 
@@ -143,7 +173,7 @@ def create_rule(
 def list_rules(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     rows = conn.execute(
         "SELECT rule_id, peer, data_category, purpose, action, effect, "
-        "created_at FROM policy_rules ORDER BY created_at ASC"
+        "agent_id, created_at FROM policy_rules ORDER BY created_at ASC"
     ).fetchall()
     return [dict(row) for row in rows]
 
@@ -159,7 +189,8 @@ def delete_rule(conn: sqlite3.Connection, rule_id: str) -> bool:
 
 def _pinned_peer(conn: sqlite3.Connection, agent_id: str) -> sqlite3.Row:
     row = conn.execute(
-        "SELECT agent_id, public_key FROM paired_peers WHERE agent_id = ?",
+        "SELECT agent_id, public_key, trust_state FROM paired_peers"
+        " WHERE agent_id = ?",
         (agent_id,),
     ).fetchone()
     if row is None:
@@ -168,7 +199,127 @@ def _pinned_peer(conn: sqlite3.Connection, agent_id: str) -> sqlite3.Row:
             "unknown peer: pair before exchanging messages.",
             status=404,
         )
+    state = row["trust_state"] if "trust_state" in row.keys() else "TRUSTED"
+    if state == "SUSPENDED":
+        raise A2AError(
+            "PEER_SUSPENDED",
+            "peer is suspended: resume trust before exchanging messages.",
+            status=403,
+        )
+    if state == "REVOKED":
+        raise A2AError(
+            "PEER_REVOKED",
+            "peer trust was revoked: re-pair to exchange messages.",
+            status=403,
+        )
     return row
+
+
+def _require_known_recipient(conn: sqlite3.Connection, agent_id: str) -> None:
+    """Outbound recipients: a paired peer or a local agent. Anything
+    else fails closed before anything is signed or stored. Trust-state
+    rejections (suspended/revoked) propagate untouched — only a truly
+    unknown peer falls through to the local-agent check."""
+    try:
+        _pinned_peer(conn, agent_id)
+        return
+    except A2AError as exc:
+        if exc.code != "NOT_PAIRED":
+            raise
+    if _local_agent_key(conn, agent_id) is None:
+        raise A2AError(
+            "NOT_PAIRED",
+            "unknown peer: pair before exchanging messages.",
+            status=404,
+        )
+
+
+def _local_agent_key(conn: sqlite3.Connection, agent_id: str) -> str | None:
+    """Active local agent's public key, or None (same-owner delivery)."""
+    row = conn.execute(
+        "SELECT i.public_key FROM agent_identities i"
+        " JOIN agents a ON a.agent_id = i.agent_id"
+        " WHERE i.agent_id = ? AND i.status = 'active'"
+        " AND a.status = 'active'"
+        " ORDER BY i.version DESC LIMIT 1",
+        (agent_id,),
+    ).fetchone()
+    return str(row["public_key"]) if row is not None else None
+
+
+def _sender_public_key(conn: sqlite3.Connection, sender_id: str) -> str:
+    """Verification key for an inbound sender: pinned peer first, then
+    an active local agent (same-process multi-agent delivery). Unknown
+    senders still fail closed via NOT_PAIRED."""
+    try:
+        return _pinned_peer(conn, sender_id)["public_key"]
+    except A2AError as exc:
+        if exc.code != "NOT_PAIRED":
+            raise
+    key = _local_agent_key(conn, sender_id)
+    if key is None:
+        raise A2AError(
+            "NOT_PAIRED",
+            "unknown peer: pair before exchanging messages.",
+            status=404,
+        )
+    return key
+
+
+def _handle_control_action(conn: sqlite3.Connection, live,
+                           payload: dict, at: str,
+                           ) -> dict[str, Any] | None:
+    """Control traffic (cancel/status) bypasses approval parking.
+
+    Returns an outcome dict when the action was control traffic (even
+    when ignored), None for ordinary requests. Authorization: the
+    sender must be a party of the referenced live task — strangers
+    cannot cancel or annotate others' work.
+    """
+    from app import tasks as task_tracker
+
+    action = str(payload.get("action", ""))
+    if action not in ("task_cancel", "task_status"):
+        return None
+    try:
+        task = task_tracker.get_task_by_correlation(
+            conn, live.correlation_id)
+    except task_tracker.TaskError:
+        return {"outcome": "ignored", "approval": None, "reply": None}
+    parties = {task["requesting_agent_id"], task["target_agent_id"]}
+    if live.sender not in parties:
+        return {"outcome": "ignored", "approval": None, "reply": None}
+    if action == "task_cancel":
+        if task["status"] in task_tracker.TERMINAL:
+            return {"outcome": "ignored", "approval": None, "reply": None}
+        if task["status"] == "RUNNING":
+            task_tracker.transition(conn, task["task_id"],
+                                    "CANCEL_REQUESTED")
+            return {"outcome": "cancel_requested", "approval": None,
+                    "reply": None}
+        task_tracker.cancel_task(conn, task["task_id"], cascade=True)
+        return {"outcome": "cancelled", "approval": None, "reply": None}
+    # task_status: advisory remote progress, recorded as an event.
+    status = str(payload.get("remote_status", "") or "")[:64]
+    detail = str(payload.get("detail", "") or "")[:500]
+    with conn:
+        # OR IGNORE: duplicate deliveries of the same status must not
+        # fail the ingest (transport retries are expected).
+        conn.execute(
+            "INSERT OR IGNORE INTO task_events (event_id, task_id, event,"
+            " detail, created_at) VALUES (?, ?, ?, ?, ?)",
+            (f"dev_{live.message_id[:12]}", task["task_id"],
+             f"TASK_REMOTE_{status or 'UNKNOWN'}", detail, at),
+        )
+    return {"outcome": "noted", "approval": None, "reply": None}
+
+
+def _is_local_recipient(conn: sqlite3.Connection, recipient: str,
+                        local_id: str) -> bool:
+    """Envelopes may address the identity or any local agent directly."""
+    if recipient == local_id:
+        return True
+    return _local_agent_key(conn, recipient) is not None
 
 
 def _store(
@@ -274,15 +425,30 @@ def create_request(
     expires_at: datetime | str | None = None,
     message_id: str | None = None,
     correlation_id: str | None = None,
+    payload_extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Sign an ask to a paired peer and store it as sent."""
+    """Sign an ask to a paired peer and store it as sent.
+
+    ``payload_extra`` carries optional delegation fields
+    (``capability_id``, ``delegation_id``, ``target_agent``,
+    ``reply_to``) inside the signed payload — same v0.3 envelope,
+    no protocol break.
+    """
     if message_type not in REQUEST_TYPES:
         raise A2AError(
             "INVALID_TYPE",
             f"ask types are {list(REQUEST_TYPES)}.",
             status=400,
         )
-    _pinned_peer(conn, recipient_id)
+    _require_known_recipient(conn, recipient_id)
+    extra = dict(payload_extra or {})
+    try:
+        json.dumps(extra)
+    except (TypeError, ValueError) as exc:
+        raise A2AError(
+            "BAD_PAYLOAD", f"payload_extra not JSON-serializable: {exc}",
+            status=400,
+        ) from exc
     unsigned = app_envelope.new_envelope(
         sender=sender_id,
         recipient=recipient_id,
@@ -292,6 +458,7 @@ def create_request(
             "question": question,
             "data_category": data_category,
             "purpose": purpose,
+            **extra,
         },
         timestamp=_now_iso(timestamp) if timestamp is not None else None,
         expires_at=_now_iso(expires_at) if expires_at is not None else None,
@@ -314,14 +481,22 @@ def send_response(
     timestamp: datetime | str | None = None,
     expires_at: datetime | str | None = None,
     message_id: str | None = None,
+    remote_task_id: str = "",
 ) -> dict[str, Any]:
-    """Sign an answer to a paired peer (post-approval) and store it."""
-    _pinned_peer(conn, recipient_id)
+    """Sign an answer to a paired peer (post-approval) and store it.
+
+    ``remote_task_id`` optionally names the responder's own task, so
+    the originator can correlate origin_task ↔ remote_task.
+    """
+    _require_known_recipient(conn, recipient_id)
+    payload: dict[str, Any] = {"action": "answer", "answer": answer}
+    if (remote_task_id or "").strip():
+        payload["remote_task_id"] = remote_task_id.strip()
     unsigned = app_envelope.new_envelope(
         sender=sender_id,
         recipient=recipient_id,
         message_type="response",
-        payload={"action": "answer", "answer": answer},
+        payload=payload,
         timestamp=_now_iso(timestamp) if timestamp is not None else None,
         expires_at=_now_iso(expires_at) if expires_at is not None else None,
         message_id=message_id,
@@ -386,22 +561,29 @@ def receive_envelope(
     except relay_envelope.EnvelopeError as exc:
         raise A2AError(exc.code, str(exc), status=400) from exc
 
-    if live.recipient != local_id:
+    if not _is_local_recipient(conn, live.recipient, local_id):
         raise A2AError(
             "INVALID_ENVELOPE",
             "envelope is not addressed to this agent.",
             status=400,
         )
-    peer = _pinned_peer(conn, live.sender)
+    sender_key = _sender_public_key(conn, live.sender)
     _store(conn, dict(envelope), "stored", at)
-    if not app_envelope.verify(dict(envelope), peer["public_key"]):
+    if not app_envelope.verify(dict(envelope), sender_key):
         raise A2AError(
             "INVALID_SIGNATURE",
-            "envelope signature does not verify against the pinned key.",
+            "envelope signature does not verify against the known key.",
             status=401,
         )
+    from app import pairing as pairing_mod
+
+    pairing_mod.touch_peer_seen(conn, live.sender, at)
 
     payload = dict(live.payload)
+    if live.message_type == "request":
+        controlled = _handle_control_action(conn, live, payload, at)
+        if controlled is not None:
+            return controlled
     if live.message_type == "request":
         decision = evaluate_policy(
             conn,
@@ -456,6 +638,19 @@ def receive_envelope(
         return {"outcome": "parked", "approval": card, "reply": None}
 
     if live.message_type in RESOLUTION_TYPES:
+        # An approval decision must answer OUR request to THIS peer: a
+        # third party naming our correlation ID cannot resolve our cards.
+        origin = conn.execute(
+            "SELECT message_id FROM a2a_messages WHERE correlation_id = ?"
+            " AND sender = ? AND recipient = ?",
+            (live.correlation_id, local_id, live.sender),
+        ).fetchone()
+        if origin is None:
+            raise A2AError(
+                "UNCORRELATED",
+                "decision matches no request we sent to this peer.",
+                status=400,
+            )
         decided = (
             "approved" if live.message_type == "approve" else "rejected"
         )
@@ -468,9 +663,64 @@ def receive_envelope(
         return {"outcome": "resolved", "approval": None, "reply": None}
 
     if live.message_type == "response":
+        # An answer must continue a conversation WE started with THIS
+        # peer: require our own outbound row with the same correlation.
+        # Unsolicited "answers" (wrong peer, invented correlation) fail
+        # closed instead of landing silently in history.
+        prior = conn.execute(
+            "SELECT message_id FROM a2a_messages WHERE correlation_id = ?"
+            " AND sender = ? AND recipient = ?",
+            (live.correlation_id, local_id, live.sender),
+        ).fetchone()
+        if prior is None:
+            raise A2AError(
+                "UNCORRELATED",
+                "response matches no request we sent to this peer.",
+                status=400,
+            )
+        # Orchestrated tasks awaiting this correlation complete with the
+        # structured answer (never NLP-parsed); late answers for
+        # terminal tasks are ignored inside, and done parents close.
+        from app import tasks as task_tracker
+
+        remote_task = payload.get("remote_task_id") or ""
+        completed = task_tracker.complete_by_correlation(
+            conn,
+            live.correlation_id,
+            {
+                "answer": payload.get("answer"),
+                "sender": live.sender,
+                "correlation_id": live.correlation_id,
+                "remote_task_id": remote_task
+                if isinstance(remote_task, str) else "",
+            },
+        )
+        if completed is not None and completed.get("parent_task_id"):
+            task_tracker.close_parent_if_done(
+                conn, completed["parent_task_id"])
         return {"outcome": "answered", "approval": None, "reply": None}
 
     if live.message_type == "error":
+        # Remote-side failure for one of our tasks: record it with its
+        # origin preserved (REMOTE_<code>), but only when the sender is
+        # the task's expected target — never a stranger's task.
+        from app import tasks as task_tracker
+
+        try:
+            match = task_tracker.get_task_by_correlation(
+                conn, live.correlation_id)
+        except task_tracker.TaskError:
+            match = None
+        if (match is not None
+                and match["status"] not in task_tracker.TERMINAL
+                and match["target_agent_id"] == live.sender):
+            code = str(payload.get("code", "UNKNOWN") or "UNKNOWN")
+            task_tracker.fail_task(
+                conn, match["task_id"], f"REMOTE_{code}",
+                f"remote {live.sender}: "
+                f"{payload.get('message', '')}"[:1500])
+            task_tracker.close_parent_if_done(
+                conn, match["parent_task_id"])
         return {"outcome": "error", "approval": None, "reply": None}
 
     return _deny(
@@ -520,6 +770,46 @@ def _check_approval_expiry(card: dict[str, Any], at: str) -> None:
         )
 
 
+def park_local_approval(
+    conn: sqlite3.Connection,
+    *,
+    requester: str,
+    action: str,
+    question: str,
+    correlation_id: str,
+    purpose: str = "answer",
+    data_category: str = "general",
+    expires_in_seconds: int = 900,
+    now: datetime | str | None = None,
+) -> dict[str, Any]:
+    """Park an owner-decision card for orchestrator-driven work.
+
+    Same row shape as inbound approvals, so the existing decide API
+    (`POST /ask/approvals/{id}/approve`) and expiry rules apply
+    unchanged. Binding to task/agent/capability lives on the task row
+    (`approval_id` + shared `correlation_id`), not the card.
+    """
+    at = _now_iso(now)
+    expires = _iso(
+        relay_envelope.parse_iso(at)
+        + timedelta(seconds=max(60, int(expires_in_seconds or 900)))
+    )
+    return _park_approval(
+        conn,
+        message_id=f"msg_task_{uuid.uuid4().hex[:12]}",
+        correlation_id=correlation_id,
+        requester=requester,
+        payload={
+            "action": action,
+            "question": question,
+            "purpose": purpose,
+            "data_category": data_category,
+        },
+        expires_at=expires,
+        now=at,
+    )
+
+
 def list_approvals(
     conn: sqlite3.Connection, status: str = "pending"
 ) -> list[dict[str, Any]]:
@@ -563,6 +853,10 @@ def approve_approval(
         message_type="approve",
         payload={"approved": True, "scope": "answer-once"},
         correlation_id=card["correlation_id"],
+        timestamp=at,
+        expires_at=_iso(
+            relay_envelope.parse_iso(at) + timedelta(seconds=300)
+        ),
     )
     signed = app_envelope.sign(unsigned, signer_priv)
     _store(conn, signed, "sent", at)
@@ -600,6 +894,10 @@ def reject_approval(
         message_type="reject",
         payload={"approved": False, "reason": reason},
         correlation_id=card["correlation_id"],
+        timestamp=at,
+        expires_at=_iso(
+            relay_envelope.parse_iso(at) + timedelta(seconds=300)
+        ),
     )
     signed = app_envelope.sign(unsigned, signer_priv)
     _store(conn, signed, "sent", at)

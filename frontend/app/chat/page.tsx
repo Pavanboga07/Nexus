@@ -1,13 +1,14 @@
 "use client";
 
-import { Fragment, useCallback, useEffect, useState } from "react";
+import { Fragment, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import Link from "next/link";
+import { useSearchParams } from "next/navigation";
 
 import { closeUnclosedFences, splitSegments } from "./markdown";
-
-const API_BASE =
-  process.env.NEXT_PUBLIC_NEXUS_API ?? "http://127.0.0.1:8001";
+import { API_BASE, api, isExpiredError, wsBase } from "../components/api";
+import { LlmStatusLine } from "../components/llm-key-settings";
+import { authHeaders } from "../components/operator";
 
 const SESSION_KEY = "nexus-session-id";
 
@@ -15,22 +16,17 @@ function mintSessionId(): string {
   return `chat-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-/** Stable recall/extraction scope: read-or-create once per browser,
- *  reused every turn (stream recall + extraction record the same id).
- *  "New chat" mints and persists a fresh one. */
 function loadOrCreateSessionId(): string {
   if (typeof localStorage === "undefined") return mintSessionId();
   try {
     const existing = localStorage.getItem(SESSION_KEY);
     if (existing) return existing;
   } catch {
-    /* storage unavailable — fall through to mint */
   }
   const fresh = mintSessionId();
   try {
     localStorage.setItem(SESSION_KEY, fresh);
   } catch {
-    /* persistence is best-effort */
   }
   return fresh;
 }
@@ -69,13 +65,43 @@ type DeliveryStatus = {
   reason?: string;
 };
 
-/** Observable delivery state for a stored row: "sent" means stored
- * locally with background delivery in flight (refresh to confirm). */
 function deliveryLabel(status: string): string {
   if (status === "relayed") return "relayed";
   if (status === "delivery_failed") return "Delivery failed — retry";
   if (status === "sent") return "Queued — delivering in background";
   return status;
+}
+
+function typeLabel(messageType: string): string {
+  switch (messageType) {
+    case "request":
+      return "Question";
+    case "response":
+      return "Answer";
+    case "approval_request":
+      return "Approval needed";
+    case "approve":
+      return "Approved";
+    case "reject":
+      return "Denied";
+    case "error":
+      return "Error";
+    default:
+      return messageType || "message";
+  }
+}
+
+/** Human name for an agent id: peer display name when known, else a
+ * short fingerprint instead of the full crypto id. */
+function peerDisplayName(
+  peers: { agent_id: string; display_name: string }[],
+  id: string
+): string {
+  const known = peers.find((p) => p.agent_id === id);
+  if (known?.display_name) return known.display_name;
+  const m = id.match(/^nexus:[a-z0-9]+:([0-9a-f]{8})/i);
+  if (m) return `agent ${m[1]}`;
+  return id.length > 24 ? `${id.slice(0, 12)}…` : id;
 }
 
 type ToAnswer = {
@@ -87,7 +113,7 @@ function ErrorState({ message }: { message: string }) {
   return (
     <p
       role="alert"
-      className="rounded-lg border border-red-900 bg-red-950 px-3 py-2 text-sm text-red-200"
+      className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700"
     >
       {message}
     </p>
@@ -100,11 +126,8 @@ type StreamToolCard = {
   result?: string;
 };
 
-/** Inline markdown for streamed text. Never uses dangerouslySetInnerHTML:
- * React escapes everything; links are restricted to http(s)/mailto. */
 function renderInline(text: string, keyPrefix: string): ReactNode[] {
   const nodes: ReactNode[] = [];
-  // `code`, **bold**, [label](url) — leftovers render as plain text.
   const pattern = /(`[^`]+`|\*\*[^*]+\*\*|\[[^\]]+\]\([^)]+\))/g;
   let last = 0;
   let match: RegExpExecArray | null;
@@ -119,17 +142,14 @@ function renderInline(text: string, keyPrefix: string): ReactNode[] {
       nodes.push(
         <code
           key={`${keyPrefix}-c${n++}`}
-          className="rounded bg-neutral-800 px-1 py-0.5 font-mono text-xs text-emerald-200"
+          className="rounded bg-bg-hover px-1 py-0.5 font-mono text-xs text-ink-2"
         >
           {token.slice(1, -1)}
         </code>
       );
     } else if (token.startsWith("**")) {
       nodes.push(
-        <strong
-          key={`${keyPrefix}-b${n++}`}
-          className="font-semibold text-neutral-100"
-        >
+        <strong key={`${keyPrefix}-b${n++}`} className="font-semibold text-ink">
           {token.slice(2, -2)}
         </strong>
       );
@@ -144,7 +164,7 @@ function renderInline(text: string, keyPrefix: string): ReactNode[] {
             href={href}
             target="_blank"
             rel="noopener noreferrer"
-            className="text-emerald-400 underline decoration-emerald-800 underline-offset-2 hover:text-emerald-300"
+            className="text-accent underline decoration-accent/30 underline-offset-2 hover:text-accent-d"
           >
             {label}
           </a>
@@ -160,7 +180,6 @@ function renderInline(text: string, keyPrefix: string): ReactNode[] {
 }
 
 function SafeMarkdown({ text }: { text: string }) {
-  // Tolerates partial tokens: an unclosed fence is closed before render.
   const segments = splitSegments(closeUnclosedFences(text));
   return (
     <>
@@ -168,17 +187,14 @@ function SafeMarkdown({ text }: { text: string }) {
         seg.kind === "code" ? (
           <pre
             key={i}
-            className="overflow-x-auto rounded-lg border border-neutral-800 bg-neutral-950 p-3 font-mono text-xs leading-relaxed text-neutral-200"
+            className="overflow-x-auto rounded-lg border border-line bg-bg-subtle p-3 font-mono text-xs leading-relaxed text-ink"
           >
             <code>{seg.text}</code>
           </pre>
         ) : (
           <span key={i} className="block space-y-2">
             {seg.text.split(/\n{2,}/).map((para, j) => (
-              <p
-                key={j}
-                className="text-sm leading-relaxed text-neutral-200"
-              >
+              <p key={j} className="text-sm leading-relaxed text-ink">
                 {renderInline(para, `${i}-${j}`)}
               </p>
             ))}
@@ -189,7 +205,6 @@ function SafeMarkdown({ text }: { text: string }) {
   );
 }
 
-/** Display-only: readable text from a stored envelope payload. */
 function messageBody(msg: ChatMessage): string {
   const payload =
     (msg.envelope as { payload?: Record<string, unknown> })?.payload ?? {};
@@ -200,168 +215,75 @@ function messageBody(msg: ChatMessage): string {
   return "";
 }
 
-class ApiError extends Error {
-  status: number;
-  code?: string;
-  constructor(message: string, status: number, code?: string) {
-    super(message);
-    this.name = "ApiError";
-    this.status = status;
-    this.code = code;
-  }
-}
-
-function isExpiredError(err: unknown): boolean {
-  return (
-    err instanceof ApiError && (err.code === "EXPIRED" || err.status === 410)
-  );
-}
-
-async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, {
-    ...init,
-    headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) },
-  });
-  const body = (await res.json().catch(() => ({}))) as T & {
-    detail?: string;
-    code?: string;
-  };
-  if (!res.ok) {
-    throw new ApiError(
-      body.detail ?? `request failed (${res.status})`,
-      res.status,
-      body.code
-    );
-  }
-  return body;
-}
-
-type LlmStatus = {
-  configured: boolean;
-  provider_hint: string;
+type ThreadTurn = {
+  role: string;
+  text: string;
+  citations: string[];
+  created_at: string;
 };
 
-/** Model-key settings: paste/rotate the key in the UI (verified live
- *  server-side before it is stored). Same form overwrites on rotate. */
-function LlmKeySettings() {
-  const [status, setStatus] = useState<LlmStatus | null>(null);
-  const [keyInput, setKeyInput] = useState("");
-  const [saving, setSaving] = useState(false);
-  const [saved, setSaved] = useState<string | null>(null);
-  const [keyError, setKeyError] = useState<string | null>(null);
-
-  const loadStatus = useCallback(async () => {
-    try {
-      setStatus(await api<LlmStatus>("/settings/llm-status"));
-    } catch {
-      /* best-effort: the stream surfaces MISSING_KEY either way */
-    }
-  }, []);
-
-  useEffect(() => {
-    void loadStatus();
-  }, [loadStatus]);
-
-  const saveKey = useCallback(async () => {
-    const key = keyInput.trim();
-    if (key.length === 0 || saving) return;
-    setSaving(true);
-    setKeyError(null);
-    setSaved(null);
-    try {
-      await api("/settings/llm-key", {
-        method: "POST",
-        body: JSON.stringify({ key }),
-      });
-      setKeyInput("");
-      setSaved("Model key saved — chat is ready.");
-      await loadStatus();
-    } catch (err) {
-      setKeyError(err instanceof Error ? err.message : "Could not save key.");
-    } finally {
-      setSaving(false);
-    }
-  }, [keyInput, saving, loadStatus]);
-
+function EmptyThread() {
   return (
-    <section
-      aria-labelledby="llm-key-heading"
-      className="mb-4 rounded-lg border border-neutral-800 bg-neutral-900 p-3"
-    >
-      <h2
-        id="llm-key-heading"
-        className="text-xs font-semibold uppercase tracking-widest text-neutral-500"
-      >
-        Model key
-      </h2>
-      <p aria-live="polite" className="mt-1 text-sm text-neutral-400">
-        {status
-          ? status.configured
-            ? `Configured (${status.provider_hint})`
-            : `No model key yet — paste your Gemini key (${status.provider_hint})`
-          : "Checking model key…"}
-      </p>
-      {saved && (
-        <p
-          role="status"
-          className="mt-2 rounded-lg border border-emerald-900 bg-emerald-950 px-3 py-2 text-sm text-emerald-200"
-        >
-          {saved}
-        </p>
-      )}
-      {keyError && (
-        <div className="mt-2">
-          <ErrorState message={keyError} />
-        </div>
-      )}
-      <form
-        onSubmit={(e) => {
-          e.preventDefault();
-          void saveKey();
-        }}
-        className="mt-2 flex flex-col gap-2 sm:flex-row sm:items-end"
-      >
-        <div className="flex-1 space-y-1">
-          <label
-            htmlFor="llm-key-input"
-            className="block text-xs font-medium uppercase tracking-wide text-neutral-500"
-          >
-            {status?.configured ? "Rotate key (paste new)" : "Gemini API key"}
-          </label>
-          <input
-            id="llm-key-input"
-            type="password"
-            value={keyInput}
-            onChange={(e) => setKeyInput(e.target.value)}
-            placeholder="Paste key…"
-            autoComplete="off"
-            disabled={saving}
-            className="w-full rounded-md border border-neutral-700 bg-neutral-950 px-3 py-2 font-mono text-sm text-neutral-200 placeholder:text-neutral-600 focus:border-emerald-600 focus:outline-none focus:ring-2 focus:ring-emerald-600/40 disabled:cursor-not-allowed disabled:opacity-50"
-          />
-        </div>
+    <div className="flex flex-1 flex-col items-center justify-center gap-4 p-8 text-center">
+      <p className="text-lg font-medium text-ink">What can I help with?</p>
+      <div className="flex flex-wrap items-center justify-center gap-2">
         <button
-          type="submit"
-          disabled={saving || keyInput.trim().length === 0}
-          className="inline-flex shrink-0 items-center justify-center rounded-md bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-500 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/50 disabled:cursor-not-allowed disabled:opacity-50"
+          type="button"
+          onClick={() => document.getElementById("stream-box")?.focus()}
+          className="inline-flex items-center justify-center rounded-full border border-line bg-bg px-4 py-2 text-sm text-ink-2 hover:bg-bg-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-accent"
         >
-          {saving
-            ? "Verifying…"
-            : status?.configured
-              ? "Rotate key"
-              : "Save key"}
+          Ask live
         </button>
-      </form>
-      <p className="mt-2 text-xs text-neutral-500">
-        Verified live before it replaces the old one — a bad key is rejected
-        and never stored.
-      </p>
-    </section>
+        <button
+          type="button"
+          onClick={() => document.getElementById("question-box")?.focus()}
+          className="inline-flex items-center justify-center rounded-full border border-line bg-bg px-4 py-2 text-sm text-ink-2 hover:bg-bg-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+        >
+          Ask a peer
+        </button>
+        <Link
+          href="/people"
+          className="inline-flex items-center justify-center rounded-full border border-line bg-bg px-4 py-2 text-sm text-ink-2 hover:bg-bg-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+        >
+          Pair a peer →
+        </Link>
+      </div>
+    </div>
   );
 }
 
-export default function ChatPage() {
+function ListSkeleton() {
+  return (
+    <div aria-hidden="true" className="space-y-4">
+      <div className="ml-auto h-10 w-2/3 animate-pulse rounded-2xl bg-bg-hover" />
+      <div className="h-16 w-full animate-pulse rounded-2xl bg-bg-hover" />
+      <div className="ml-auto h-10 w-1/2 animate-pulse rounded-2xl bg-bg-hover" />
+    </div>
+  );
+}
+
+function ChatInner() {
+  const searchParams = useSearchParams();
+  const threadParam = searchParams.get("t") ?? "";
   const [peers, setPeers] = useState<Peer[]>([]);
   const [peerId, setPeerId] = useState("");
+  const [agentHandle, setAgentHandle] = useState(() => {
+    try {
+      return localStorage.getItem("nexus-chat-agent") || "default";
+    } catch {
+      return "default";
+    }
+  });
+  const [agentOptions, setAgentOptions] = useState<string[]>(["default"]);
+
+  const pickAgent = useCallback((name: string) => {
+    setAgentHandle(name);
+    try {
+      localStorage.setItem("nexus-chat-agent", name);
+    } catch {
+      /* persistence is best-effort */
+    }
+  }, []);
   const [question, setQuestion] = useState("");
   const [cards, setCards] = useState<ApprovalCard[]>([]);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -375,19 +297,65 @@ export default function ChatPage() {
   const [citations, setCitations] = useState<string[]>([]);
   const [streaming, setStreaming] = useState(false);
   const [streamError, setStreamError] = useState<string | null>(null);
-  // Stable recall/extraction scope persisted across reloads: stream
-  // recall injects only this session's memories, and extraction records
-  // the same id. "New chat" below rotates it.
-  const [sessionId, setSessionId] = useState(loadOrCreateSessionId);
-  // Sidebar visibility only: presentation state, no chat semantics.
-  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [sessionId, setSessionId] = useState(
+    () => threadParam || loadOrCreateSessionId()
+  );
   const [live, setLive] = useState<"off" | "on" | "down">("off");
+  const [historyTurns, setHistoryTurns] = useState<ThreadTurn[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [initialLoading, setInitialLoading] = useState(true);
+  const streamAccumRef = useRef<{
+    tokens: string;
+    doneText: string;
+    citations: string[];
+  }>({ tokens: "", doneText: "", citations: [] });
+
+  // The URL thread (?t=) is the source of truth: switching history in
+  // the sidebar swaps sessions; bare /chat continues (or mints) the
+  // stored one and writes it back into the URL.
+  useEffect(() => {
+    if (threadParam) {
+      setSessionId(threadParam);
+      setStreamText(null);
+      setToolCards([]);
+      setCitations([]);
+      setStreamError(null);
+    } else {
+      const current = loadOrCreateSessionId();
+      setSessionId(current);
+      window.history.replaceState(null, "", `/chat?t=${encodeURIComponent(current)}`);
+    }
+  }, [threadParam]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!threadParam) {
+      setHistoryTurns([]);
+      setHistoryLoading(false);
+      return () => {};
+    }
+    setHistoryLoading(true);
+    api<{ turns: ThreadTurn[] }>(
+      `/chat/threads/${encodeURIComponent(threadParam)}?agent=${encodeURIComponent(agentHandle)}`
+    )
+      .then((data) => {
+        if (!cancelled) setHistoryTurns(data.turns);
+      })
+      .catch(() => {
+        if (!cancelled) setHistoryTurns([]);
+      })
+      .finally(() => {
+        if (!cancelled) setHistoryLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [threadParam, agentHandle]);
   const [toAnswer, setToAnswer] = useState<ToAnswer[]>([]);
   const [answerText, setAnswerText] = useState<Record<string, string>>({});
   const [answering, setAnswering] = useState<string | null>(null);
   const [retrying, setRetrying] = useState<string | null>(null);
 
-  // Polled rows indexed by id/correlation for delivery-state lookups.
   const messagesById = new Map(messages.map((m) => [m.message_id, m]));
   const messagesByCorrelation = new Map(
     messages.map((m) => [m.correlation_id, m])
@@ -395,10 +363,13 @@ export default function ChatPage() {
 
   const refresh = useCallback(async () => {
     try {
-      const [peerData, cardData, msgData] = await Promise.all([
+      const [peerData, cardData, msgData, agentData] = await Promise.all([
         api<{ peers: Peer[] }>("/pairing/peers"),
         api<{ approvals: ApprovalCard[] }>("/ask/approvals"),
         api<{ messages: ChatMessage[] }>("/ask/messages"),
+        api<{ agents: { id: string }[] }>("/agents").catch(() => ({
+          agents: [],
+        })),
       ]);
       setPeers(peerData.peers);
       setCards(cardData.approvals);
@@ -406,49 +377,65 @@ export default function ChatPage() {
       if (!peerId && peerData.peers.length > 0) {
         setPeerId(peerData.peers[0].agent_id);
       }
+      const names = agentData.agents.map((a) => a.id);
+      if (names.length > 0) {
+        setAgentOptions(names.includes("default") ? names : ["default", ...names]);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not load chat.");
     }
   }, [peerId]);
 
   useEffect(() => {
-    refresh();
+    void refresh().finally(() => setInitialLoading(false));
   }, [refresh]);
 
-  // Live relay deliveries: the backend holds the signed relay socket
-  // (/ask/live bridges it); every delivery refreshes approvals/messages.
-  // Best-effort: manual refresh below always works when live is down.
   useEffect(() => {
     let closed = false;
     let ws: WebSocket | null = null;
-    try {
-      ws = new WebSocket(`${API_BASE.replace(/^http/, "ws")}/ask/live`);
-    } catch {
-      setLive("down");
-      return () => {};
-    }
-    ws.onopen = () => {
-      if (!closed) setLive("on");
-    };
-    ws.onmessage = (event) => {
+    // Browsers cannot send Authorization on a WS handshake: mint a
+    // single-use ticket over authed HTTP first, then connect with it.
+    void (async () => {
+      let ticket = "";
       try {
-        const msg = JSON.parse(event.data as string) as { type?: string };
-        if (msg.type === "delivery") void refresh();
+        const data = await api<{ ticket: string }>("/ask/live-ticket", {
+          method: "POST",
+        });
+        ticket = data.ticket;
       } catch {
-        /* ignore malformed frames */
+        if (!closed) setLive("down");
+        return;
       }
-    };
-    const markDown = () => {
-      if (!closed) setLive("down");
-    };
-    ws.onerror = markDown;
-    ws.onclose = markDown;
+      if (closed) return;
+      try {
+        ws = new WebSocket(
+          `${wsBase()}/ask/live?ticket=${encodeURIComponent(ticket)}`
+        );
+      } catch {
+        if (!closed) setLive("down");
+        return;
+      }
+      ws.onopen = () => {
+        if (!closed) setLive("on");
+      };
+      ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data as string) as { type?: string };
+          if (msg.type === "delivery") void refresh();
+        } catch {
+        }
+      };
+      const markDown = () => {
+        if (!closed) setLive("down");
+      };
+      ws.onerror = markDown;
+      ws.onclose = markDown;
+    })();
     return () => {
       closed = true;
       try {
         ws?.close();
       } catch {
-        /* teardown is best-effort */
       }
     };
   }, [refresh]);
@@ -632,10 +619,12 @@ export default function ChatPage() {
     setStreamText("");
     setToolCards([]);
     setCitations([]);
+    streamAccumRef.current = { tokens: "", doneText: "", citations: [] };
+    let failed = false;
     try {
       const res = await fetch(
-        `${API_BASE}/chat/stream?message=${encodeURIComponent(prompt)}&session_id=${encodeURIComponent(sessionId)}`,
-        { headers: { Accept: "text/event-stream" } }
+        `${API_BASE}/chat/stream?message=${encodeURIComponent(prompt)}&session_id=${encodeURIComponent(sessionId)}&agent=${encodeURIComponent(agentHandle)}`,
+        { headers: { Accept: "text/event-stream", ...authHeaders() } }
       );
       if (!res.ok || !res.body) {
         const body = (await res.json().catch(() => ({}))) as {
@@ -667,6 +656,7 @@ export default function ChatPage() {
             };
             if (evt.type === "token" && evt.text) {
               setStreamText((prev) => (prev ?? "") + (evt.text as string));
+              streamAccumRef.current.tokens += evt.text as string;
             } else if (evt.type === "tool_pending" && evt.tool) {
               const tool = evt.tool;
               setToolCards((prev) => [...prev, { tool, status: "pending" }]);
@@ -691,7 +681,9 @@ export default function ChatPage() {
                 setStreamText((prev) =>
                   prev && prev.length > 0 ? prev : text
                 );
+                streamAccumRef.current.doneText = text;
               }
+              streamAccumRef.current.citations = evt.citations ?? [];
               setCitations(evt.citations ?? []);
             } else if (evt.type === "error") {
               throw new Error(evt.message ?? "Stream failed.");
@@ -700,33 +692,37 @@ export default function ChatPage() {
         }
       }
     } catch (err) {
+      failed = true;
       setStreamError(err instanceof Error ? err.message : "Stream failed.");
     } finally {
       setStreaming(false);
+      // Fold the finished turn into local history (the server persisted
+      // the same rows): the thread reads as one conversation and the
+      // stream block clears instead of duplicating.
+      if (!failed) {
+        const accum = streamAccumRef.current;
+        const finalText = accum.doneText || accum.tokens;
+        if (finalText) {
+          const userText = prompt;
+          const assistantCits = accum.citations;
+          setHistoryTurns((prev) => [
+            ...prev,
+            { role: "user", text: userText, citations: [], created_at: "" },
+            {
+              role: "assistant",
+              text: finalText,
+              citations: assistantCits,
+              created_at: "",
+            },
+          ]);
+          setStreamText(null);
+          setToolCards([]);
+          setCitations([]);
+        }
+      }
     }
-  }, [streamInput, streaming, sessionId]);
+  }, [streamInput, streaming, sessionId, agentHandle]);
 
-  // "New chat" rotates the recall/extraction scope and clears the
-  // session-scoped stream turn. Stored ask rows are global and reload
-  // from the server, so there is nothing local to clear for them.
-  const newChat = useCallback(() => {
-    if (streaming) return;
-    setStreamInput("");
-    setStreamText(null);
-    setToolCards([]);
-    setCitations([]);
-    setStreamError(null);
-    const fresh = mintSessionId();
-    try {
-      localStorage.setItem(SESSION_KEY, fresh);
-    } catch {
-      /* persistence is best-effort */
-    }
-    setSessionId(fresh);
-    setSidebarOpen(false);
-  }, [streaming]);
-
-  // Display-only derived values for the conversational thread layout.
   const selectedPeer = peers.find((p) => p.agent_id === peerId) ?? null;
   const pendingCount = cards.length;
   const cardsByCorrelation = new Map<string, ApprovalCard[]>();
@@ -748,169 +744,107 @@ export default function ChatPage() {
   const threadEmpty =
     messages.length === 0 &&
     cards.length === 0 &&
+    historyTurns.length === 0 &&
     !hasStreamTurn &&
+    !historyLoading &&
     !status &&
     !error;
 
   return (
-    <div className="flex min-h-screen bg-neutral-950 text-neutral-200">
-      {sidebarOpen && (
-        <button
-          type="button"
-          aria-label="Close sidebar"
-          onClick={() => setSidebarOpen(false)}
-          className="fixed inset-0 z-30 bg-black/60 md:hidden"
-        />
-      )}
-      <aside
-        id="chat-sidebar"
-        aria-label="Chat sidebar"
-        className={`fixed inset-y-0 left-0 z-40 flex w-64 shrink-0 -translate-x-full flex-col border-r border-neutral-800 bg-neutral-900 transition-transform md:static md:translate-x-0 ${
-          sidebarOpen ? "translate-x-0" : ""
-        }`}
-      >
-        <div className="flex items-center gap-2 p-3">
-          <button
-            type="button"
-            onClick={newChat}
-            disabled={streaming}
-            aria-label="Start a new chat"
-            className="inline-flex flex-1 items-center justify-center gap-2 rounded-lg border border-neutral-700 bg-neutral-950 px-3 py-2 text-sm font-medium text-neutral-100 hover:border-emerald-700 hover:text-emerald-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/50 disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            <span aria-hidden="true" className="text-base leading-none">
-              +
-            </span>
-            New chat
-          </button>
-          <button
-            type="button"
-            onClick={() => setSidebarOpen(false)}
-            aria-label="Close sidebar"
-            className="inline-flex items-center justify-center rounded-lg border border-neutral-800 px-2 py-2 text-sm text-neutral-400 hover:text-neutral-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/50 md:hidden"
-          >
-            <span aria-hidden="true">✕</span>
-          </button>
-        </div>
-        <nav
-          aria-label="Secondary"
-          className="flex flex-col gap-1 px-3 text-sm"
-        >
-          <Link
-            href="/people"
-            className="rounded-lg px-3 py-2 text-neutral-300 hover:bg-neutral-800 hover:text-neutral-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-600"
-          >
-            People
-          </Link>
-          <Link
-            href="/memory"
-            className="rounded-lg px-3 py-2 text-neutral-300 hover:bg-neutral-800 hover:text-neutral-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-600"
-          >
-            Memory
-          </Link>
-        </nav>
-        <div className="mt-auto space-y-1 border-t border-neutral-800 p-3">
-          <p
-            aria-live="polite"
-            className="truncate font-mono text-[11px] text-neutral-500"
-          >
-            {selectedPeer
-              ? `${selectedPeer.display_name} · ${selectedPeer.fingerprint}`
-              : "no peer selected"}
-          </p>
-          <p className="text-xs text-neutral-500">
-            {live === "on" ? "live relay on" : "live relay off"}
-          </p>
-        </div>
-      </aside>
-
+    <div className="flex min-h-screen bg-bg text-ink">
       <div className="flex min-w-0 flex-1 flex-col">
-        <header className="sticky top-0 z-20 flex flex-wrap items-center gap-x-3 gap-y-2 border-b border-neutral-800 bg-neutral-950/95 px-3 py-2 backdrop-blur">
-          <button
-            type="button"
-            onClick={() => setSidebarOpen(true)}
-            aria-label="Open sidebar"
-            aria-expanded={sidebarOpen}
-            aria-controls="chat-sidebar"
-            className="inline-flex items-center justify-center rounded-md border border-neutral-800 px-2 py-1.5 text-neutral-300 hover:text-neutral-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/50 md:hidden"
-          >
-            <svg
-              aria-hidden="true"
-              width="18"
-              height="18"
-              viewBox="0 0 18 18"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2"
-              strokeLinecap="round"
-            >
-              <line x1="2" y1="4" x2="16" y2="4" />
-              <line x1="2" y1="9" x2="16" y2="9" />
-              <line x1="2" y1="14" x2="16" y2="14" />
-            </svg>
-          </button>
-          <h1 className="text-sm font-semibold tracking-tight text-neutral-50">
+        <header className="sticky top-0 z-20 flex flex-wrap items-center gap-x-4 gap-y-2 border-b border-line bg-bg/95 px-4 py-3 backdrop-blur">
+          <h1 className="text-base font-semibold tracking-tight text-ink">
             Chat
           </h1>
-        {peers.length === 0 ? (
-          <p className="text-xs text-neutral-500">No paired peers yet.</p>
-        ) : (
-          <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-3 gap-y-1">
+          <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
             <label
-              htmlFor="peer-picker"
-              className="text-xs font-medium uppercase tracking-wide text-neutral-500"
+              htmlFor="agent-picker"
+              className="text-xs font-medium text-ink-2"
             >
-              Peer
+              Agent
             </label>
-            <select
-              id="peer-picker"
-              value={peerId}
-              onChange={(e) => setPeerId(e.target.value)}
+              <select
+                id="agent-picker"
+                value={agentHandle}
+                onChange={(e) => pickAgent(e.target.value)}
               disabled={askBusy || streaming}
-              aria-label="Peer"
-              className="min-w-0 max-w-full flex-1 rounded-md border border-neutral-700 bg-neutral-950 px-2 py-1 text-sm text-neutral-200 focus:border-emerald-600 focus:outline-none focus:ring-2 focus:ring-emerald-600/40 disabled:cursor-not-allowed disabled:opacity-50 sm:max-w-xs"
+              aria-label="Agent"
+              className="min-w-0 max-w-full rounded-lg border border-line bg-bg px-2 py-1.5 text-sm text-ink focus:border-accent focus:outline-none focus:ring-2 focus:ring-accent/20 disabled:cursor-not-allowed disabled:opacity-50 sm:max-w-[10rem]"
             >
-              {peers.map((peer) => (
-                <option key={peer.agent_id} value={peer.agent_id}>
-                  {peer.display_name} ({peer.fingerprint})
+              {agentOptions.map((name) => (
+                <option key={name} value={name}>
+                  {name}
                 </option>
               ))}
             </select>
-            <p aria-live="polite" className="min-w-0 truncate font-mono text-[11px] text-neutral-500">
-              {selectedPeer
-                ? `connected · ${selectedPeer.display_name} · ${selectedPeer.fingerprint}`
-                : "no peer selected"}
-            </p>
           </div>
-        )}
-        <span
-          aria-label={`${pendingCount} pending approvals`}
-          title={`${pendingCount} pending approvals`}
-          className={
-            pendingCount > 0
-              ? "inline-flex items-center rounded-full border border-amber-900 bg-amber-950/40 px-2 py-0.5 text-xs font-medium text-amber-200"
-              : "inline-flex items-center rounded-full border border-neutral-800 bg-neutral-950 px-2 py-0.5 text-xs text-neutral-500"
-          }
-        >
-          {pendingCount} pending
-        </span>
-        <span
-          aria-label={live === "on" ? "Live relay updates on" : "Live relay updates off"}
-          title={
-            live === "on"
-              ? "Relay deliveries refresh this view live"
-              : "Live updates unavailable — approvals refresh on send/decide"
-          }
-          className={
-            live === "on"
-              ? "inline-flex items-center rounded-full border border-emerald-900 bg-emerald-950/40 px-2 py-0.5 text-xs font-medium text-emerald-300"
-              : "inline-flex items-center rounded-full border border-neutral-800 bg-neutral-950 px-2 py-0.5 text-xs text-neutral-500"
-          }
-        >
-          {live === "on" ? "live" : "live off"}
-        </span>
-      </header>
+          {peers.length === 0 ? (
+            <p className="text-xs text-ink-3">No paired peers yet.</p>
+          ) : (
+            <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-3 gap-y-1">
+              <label
+                htmlFor="peer-picker"
+                className="text-xs font-medium text-ink-2"
+              >
+                Peer
+              </label>
+              <select
+                id="peer-picker"
+                value={peerId}
+                onChange={(e) => setPeerId(e.target.value)}
+                disabled={askBusy || streaming}
+                aria-label="Peer"
+                className="min-w-0 max-w-full flex-1 rounded-lg border border-line bg-bg px-2 py-1.5 text-sm text-ink focus:border-accent focus:outline-none focus:ring-2 focus:ring-accent/20 disabled:cursor-not-allowed disabled:opacity-50 sm:max-w-xs"
+              >
+                {peers.map((peer) => (
+                  <option key={peer.agent_id} value={peer.agent_id}>
+                    {peer.display_name} ({peer.fingerprint})
+                  </option>
+                ))}
+              </select>
+              <p aria-live="polite" className="min-w-0 truncate font-mono text-[11px] text-ink-3">
+                {selectedPeer
+                  ? `connected · ${selectedPeer.display_name} · ${selectedPeer.fingerprint}`
+                  : "no peer selected"}
+              </p>
+            </div>
+          )}
+          <span
+            aria-label={`${pendingCount} pending approvals`}
+            title={`${pendingCount} pending approvals`}
+            className={
+              pendingCount > 0
+                ? "inline-flex items-center rounded-full bg-amber-100 px-2.5 py-0.5 text-xs font-medium text-amber-800"
+                : "inline-flex items-center rounded-full bg-bg-subtle px-2.5 py-0.5 text-xs text-ink-3"
+            }
+          >
+            {pendingCount} pending
+          </span>
+          <span
+            aria-label={live === "on" ? "Live relay updates on" : "Live relay updates off"}
+            title={
+              live === "on"
+                ? "Relay deliveries refresh this view live"
+                : "Live updates unavailable — approvals refresh on send/decide"
+            }
+            className={
+              live === "on"
+                ? "inline-flex items-center gap-1.5 rounded-full bg-emerald-50 px-2.5 py-0.5 text-xs font-medium text-emerald-700"
+                : "inline-flex items-center gap-1.5 rounded-full bg-bg-subtle px-2.5 py-0.5 text-xs text-ink-3"
+            }
+          >
+            <span
+              aria-hidden="true"
+              className={`h-1.5 w-1.5 rounded-full ${
+                live === "on" ? "bg-emerald-500" : "bg-ink-3"
+              }`}
+            />
+            {live === "on" ? "live" : "live off"}
+          </span>
+        </header>
 
-        <main className="flex flex-1 flex-col px-3 py-4 sm:px-4">
+        <main className="flex flex-1 flex-col px-4 py-6 sm:px-6">
           <section
             aria-labelledby="messages-heading"
             className="mx-auto flex w-full max-w-3xl flex-1 flex-col"
@@ -918,21 +852,27 @@ export default function ChatPage() {
             <h2 id="messages-heading" className="sr-only">
               Conversation
             </h2>
-            <LlmKeySettings />
+            <LlmStatusLine />
             {threadEmpty ? (
-              <div className="flex flex-1 items-center justify-center p-8">
-                <p className="text-center text-sm text-neutral-500">
-                  No messages yet.
-                </p>
-              </div>
+              initialLoading || historyLoading ? (
+                <div
+                  aria-busy="true"
+                  aria-live="polite"
+                  className="flex flex-1 flex-col justify-center p-8"
+                >
+                  <ListSkeleton />
+                </div>
+              ) : (
+                <EmptyThread />
+              )
             ) : (
-              <ul className="flex-1 space-y-4">
+              <ul className="flex-1 space-y-6">
             {status && (
               <li>
                 <p
                   role="status"
                   aria-live="polite"
-                  className="mx-auto max-w-md rounded-lg border border-emerald-900 bg-emerald-950 px-3 py-2 text-center text-sm text-emerald-200"
+                  className="mx-auto max-w-md rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-center text-sm text-emerald-700"
                 >
                   {status}
                 </p>
@@ -944,6 +884,54 @@ export default function ChatPage() {
               </li>
             )}
 
+            {historyLoading && historyTurns.length === 0 && (
+              <li aria-busy="true" aria-live="polite">
+                <ListSkeleton />
+              </li>
+            )}
+            {historyTurns.map((turn, i) =>
+              turn.role === "user" ? (
+                <li key={`history-${i}`} className="flex justify-end">
+                  <div className="ml-auto max-w-[85%] rounded-2xl rounded-br-md bg-bg-subtle px-4 py-2.5">
+                    <p className="text-sm text-ink">{turn.text}</p>
+                  </div>
+                </li>
+              ) : (
+                <li key={`history-${i}`} className="flex gap-3">
+                  <div
+                    aria-hidden="true"
+                    className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-accent text-xs font-semibold text-white"
+                  >
+                    N
+                  </div>
+                  <div className="min-w-0 flex-1 space-y-2">
+                    <article className="space-y-2">
+                      <SafeMarkdown text={turn.text} />
+                    </article>
+                    {turn.citations.length > 0 && (
+                      <ul
+                        aria-label="Sources"
+                        className="space-y-1 border-t border-line pt-2"
+                      >
+                        {turn.citations.map((url) => (
+                          <li key={url}>
+                            <a
+                              href={url}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="block truncate text-xs text-accent hover:text-accent-d hover:underline"
+                            >
+                              {url}
+                            </a>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                </li>
+              )
+            )}
+
             {messages.map((msg) => {
               const isRequest = msg.message_type === "request";
               const body = messageBody(msg);
@@ -953,13 +941,13 @@ export default function ChatPage() {
                 <Fragment key={msg.message_id}>
                   <li
                     className={
-                      isRequest ? "flex justify-end" : "flex gap-2.5"
+                      isRequest ? "flex justify-end" : "flex gap-3"
                     }
                   >
                     {!isRequest && (
                       <div
                         aria-hidden="true"
-                        className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full border border-emerald-900 bg-emerald-950 text-xs font-semibold text-emerald-300"
+                        className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-accent text-xs font-semibold text-white"
                       >
                         N
                       </div>
@@ -967,27 +955,29 @@ export default function ChatPage() {
                     <div
                       className={
                         isRequest
-                          ? "ml-auto max-w-[85%] rounded-2xl rounded-br-sm border border-emerald-900 bg-emerald-950/40 px-3 py-2"
-                          : "min-w-0 flex-1 rounded-2xl border border-neutral-800 bg-neutral-950 px-3 py-2"
+                          ? "ml-auto max-w-[85%] rounded-2xl rounded-br-md bg-bg-subtle px-4 py-2.5"
+                          : "min-w-0 flex-1"
                       }
                     >
-                      <p className="font-mono text-[11px] uppercase tracking-wide text-neutral-500">
-                        {msg.message_type} ({deliveryLabel(msg.status)})
+                      <p className="font-mono text-[11px] uppercase tracking-wide text-ink-3">
+                        {typeLabel(msg.message_type)} ({deliveryLabel(msg.status)})
                       </p>
                       {body ? (
                         isRequest ? (
-                          <p className="text-sm text-neutral-100">{body}</p>
+                          <p className="text-sm text-ink">{body}</p>
                         ) : (
                           <SafeMarkdown text={body} />
                         )
                       ) : (
-                        <p className="text-sm text-neutral-200">
-                          {msg.sender} → {msg.recipient}
+                        <p className="text-sm text-ink-2">
+                          {peerDisplayName(peers, msg.sender)} →{" "}
+                          {peerDisplayName(peers, msg.recipient)}
                         </p>
                       )}
                       {body && (
-                        <p className="mt-1 text-xs text-neutral-500">
-                          {msg.sender} → {msg.recipient}
+                        <p className="mt-1 text-xs text-ink-3">
+                          {peerDisplayName(peers, msg.sender)} →{" "}
+                          {peerDisplayName(peers, msg.recipient)}
                         </p>
                       )}
                       {msg.status === "delivery_failed" && (
@@ -996,7 +986,7 @@ export default function ChatPage() {
                           onClick={() => void retryDelivery(msg.message_id)}
                           disabled={retrying === msg.message_id}
                           aria-label={`Retry delivery of ${msg.message_id}`}
-                          className="mt-2 inline-flex items-center justify-center rounded-md border border-amber-800 bg-amber-900/60 px-3 py-1 text-xs font-medium text-amber-100 hover:bg-amber-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/50 disabled:cursor-not-allowed disabled:opacity-50"
+                          className="mt-2 inline-flex items-center justify-center rounded-lg border border-amber-200 bg-amber-50 px-3 py-1.5 text-xs font-medium text-amber-800 hover:bg-amber-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/50 disabled:cursor-not-allowed disabled:opacity-50"
                         >
                           {retrying === msg.message_id
                             ? "Retrying…"
@@ -1008,35 +998,35 @@ export default function ChatPage() {
                   {inlineCards.map((card) => (
                     <li key={card.approval_id} className="flex justify-start">
                       <div
-                        aria-label={`Approval ${card.action} for ${card.requester}`}
-                        className="w-full space-y-3 rounded-2xl border border-amber-900/60 bg-neutral-950 px-3 py-2"
+                        aria-label={`Approval ${card.action} for ${peerDisplayName(peers, card.requester)}`}
+                        className="w-full space-y-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3"
                       >
-                        <h3 className="text-sm font-semibold text-neutral-100">
-                          {card.action} for {card.requester}
+                        <h3 className="text-sm font-semibold text-ink">
+                          {card.action} for {peerDisplayName(peers, card.requester)}
                         </h3>
                         <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-sm">
-                          <dt className="text-xs font-medium uppercase tracking-wide text-neutral-500">
+                          <dt className="text-xs font-medium uppercase tracking-wide text-ink-3">
                             Who
                           </dt>
-                          <dd className="text-neutral-200">
-                            {card.requester}
+                          <dd className="text-ink-2">
+                            {peerDisplayName(peers, card.requester)}
                           </dd>
-                          <dt className="text-xs font-medium uppercase tracking-wide text-neutral-500">
+                          <dt className="text-xs font-medium uppercase tracking-wide text-ink-3">
                             What
                           </dt>
-                          <dd className="text-neutral-200">
+                          <dd className="text-ink-2">
                             {card.question} ({card.data_category})
                           </dd>
-                          <dt className="text-xs font-medium uppercase tracking-wide text-neutral-500">
+                          <dt className="text-xs font-medium uppercase tracking-wide text-ink-3">
                             Why
                           </dt>
-                          <dd className="text-neutral-200">
+                          <dd className="text-ink-2">
                             {card.purpose}
                           </dd>
-                          <dt className="text-xs font-medium uppercase tracking-wide text-neutral-500">
+                          <dt className="text-xs font-medium uppercase tracking-wide text-ink-3">
                             Expiry
                           </dt>
-                          <dd className="font-mono text-xs text-neutral-400">
+                          <dd className="font-mono text-xs text-ink-3">
                             {card.expires_at}
                           </dd>
                         </dl>
@@ -1045,7 +1035,7 @@ export default function ChatPage() {
                             type="button"
                             onClick={() => decide(card.approval_id, "approve")}
                             disabled={deciding === card.approval_id}
-                            className="inline-flex items-center justify-center rounded-md bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-500 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/50 disabled:cursor-not-allowed disabled:opacity-50"
+                            className="inline-flex items-center justify-center rounded-lg bg-accent px-4 py-2 text-sm font-medium text-white hover:bg-accent-d focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/50 disabled:cursor-not-allowed disabled:opacity-50"
                           >
                             {deciding === card.approval_id
                               ? "Working…"
@@ -1055,7 +1045,7 @@ export default function ChatPage() {
                             type="button"
                             onClick={() => decide(card.approval_id, "reject")}
                             disabled={deciding === card.approval_id}
-                            className="inline-flex items-center justify-center rounded-md border border-red-800 bg-red-900/60 px-4 py-2 text-sm font-medium text-red-100 hover:bg-red-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-red-500/50 disabled:cursor-not-allowed disabled:opacity-50"
+                            className="inline-flex items-center justify-center rounded-lg border border-red-200 bg-bg px-4 py-2 text-sm font-medium text-red-600 hover:bg-red-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-red-500/50 disabled:cursor-not-allowed disabled:opacity-50"
                           >
                             {deciding === card.approval_id
                               ? "Working…"
@@ -1072,31 +1062,31 @@ export default function ChatPage() {
             {trailingCards.map((card) => (
               <li key={card.approval_id} className="flex justify-start">
                 <div
-                  aria-label={`Approval ${card.action} for ${card.requester}`}
-                  className="w-full space-y-3 rounded-2xl border border-amber-900/60 bg-neutral-950 px-3 py-2"
+                  aria-label={`Approval ${card.action} for ${peerDisplayName(peers, card.requester)}`}
+                  className="w-full space-y-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3"
                 >
-                  <h3 className="text-sm font-semibold text-neutral-100">
-                    {card.action} for {card.requester}
+                  <h3 className="text-sm font-semibold text-ink">
+                    {card.action} for {peerDisplayName(peers, card.requester)}
                   </h3>
                   <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-sm">
-                    <dt className="text-xs font-medium uppercase tracking-wide text-neutral-500">
+                    <dt className="text-xs font-medium uppercase tracking-wide text-ink-3">
                       Who
                     </dt>
-                    <dd className="text-neutral-200">{card.requester}</dd>
-                    <dt className="text-xs font-medium uppercase tracking-wide text-neutral-500">
+                    <dd className="text-ink-2">{peerDisplayName(peers, card.requester)}</dd>
+                    <dt className="text-xs font-medium uppercase tracking-wide text-ink-3">
                       What
                     </dt>
-                    <dd className="text-neutral-200">
+                    <dd className="text-ink-2">
                       {card.question} ({card.data_category})
                     </dd>
-                    <dt className="text-xs font-medium uppercase tracking-wide text-neutral-500">
+                    <dt className="text-xs font-medium uppercase tracking-wide text-ink-3">
                       Why
                     </dt>
-                    <dd className="text-neutral-200">{card.purpose}</dd>
-                    <dt className="text-xs font-medium uppercase tracking-wide text-neutral-500">
+                    <dd className="text-ink-2">{card.purpose}</dd>
+                    <dt className="text-xs font-medium uppercase tracking-wide text-ink-3">
                       Expiry
                     </dt>
-                    <dd className="font-mono text-xs text-neutral-400">
+                    <dd className="font-mono text-xs text-ink-3">
                       {card.expires_at}
                     </dd>
                   </dl>
@@ -1105,7 +1095,7 @@ export default function ChatPage() {
                       type="button"
                       onClick={() => decide(card.approval_id, "approve")}
                       disabled={deciding === card.approval_id}
-                      className="inline-flex items-center justify-center rounded-md bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-500 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/50 disabled:cursor-not-allowed disabled:opacity-50"
+                      className="inline-flex items-center justify-center rounded-lg bg-accent px-4 py-2 text-sm font-medium text-white hover:bg-accent-d focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/50 disabled:cursor-not-allowed disabled:opacity-50"
                     >
                       {deciding === card.approval_id ? "Working…" : "Approve"}
                     </button>
@@ -1113,7 +1103,7 @@ export default function ChatPage() {
                       type="button"
                       onClick={() => decide(card.approval_id, "reject")}
                       disabled={deciding === card.approval_id}
-                      className="inline-flex items-center justify-center rounded-md border border-red-800 bg-red-900/60 px-4 py-2 text-sm font-medium text-red-100 hover:bg-red-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-red-500/50 disabled:cursor-not-allowed disabled:opacity-50"
+                      className="inline-flex items-center justify-center rounded-lg border border-red-200 bg-bg px-4 py-2 text-sm font-medium text-red-600 hover:bg-red-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-red-500/50 disabled:cursor-not-allowed disabled:opacity-50"
                     >
                       {deciding === card.approval_id ? "Working…" : "Deny"}
                     </button>
@@ -1122,14 +1112,14 @@ export default function ChatPage() {
               </li>
             ))}
             {hasStreamTurn && (
-              <li className="flex gap-2.5">
+              <li className="flex gap-3">
                 <div
                   aria-hidden="true"
-                  className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full border border-emerald-900 bg-emerald-950 text-xs font-semibold text-emerald-300"
+                  className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-accent text-xs font-semibold text-white"
                 >
                   N
                 </div>
-                <div className="min-w-0 flex-1 space-y-2 rounded-2xl border border-neutral-800 bg-neutral-950 px-3 py-2">
+                <div className="min-w-0 flex-1 space-y-2">
                   {streamError && <ErrorState message={streamError} />}
                   {toolCards.length > 0 && (
                     <ul
@@ -1142,8 +1132,8 @@ export default function ChatPage() {
                           aria-busy={card.status === "pending"}
                           className={
                             card.status === "pending"
-                              ? "inline-flex max-w-full items-center gap-2 rounded-full border border-amber-900 bg-amber-950/40 px-3 py-1 font-mono text-xs text-amber-200"
-                              : "inline-flex max-w-full items-center gap-2 rounded-full border border-emerald-900 bg-emerald-950/40 px-3 py-1 font-mono text-xs text-emerald-200"
+                              ? "inline-flex max-w-full items-center gap-2 rounded-full bg-amber-50 px-3 py-1 font-mono text-xs text-amber-700"
+                              : "inline-flex max-w-full items-center gap-2 rounded-full bg-bg-subtle px-3 py-1 font-mono text-xs text-ink-2"
                           }
                         >
                           <span className="truncate">
@@ -1153,7 +1143,7 @@ export default function ChatPage() {
                               : "done"}
                           </span>
                           {card.status === "completed" && card.result && (
-                            <span className="max-w-[12rem] truncate text-neutral-400">
+                            <span className="max-w-[12rem] truncate text-ink-3">
                               — {card.result.slice(0, 120)}
                             </span>
                           )}
@@ -1166,7 +1156,7 @@ export default function ChatPage() {
                     toolCards.length === 0 && (
                       <p
                         aria-live="polite"
-                        className="animate-pulse text-sm text-neutral-500"
+                        className="animate-pulse text-sm text-ink-3"
                       >
                         Thinking…
                       </p>
@@ -1179,7 +1169,7 @@ export default function ChatPage() {
                   {citations.length > 0 && (
                     <ul
                       aria-label="Sources"
-                      className="space-y-1 border-t border-neutral-800 pt-2"
+                      className="space-y-1 border-t border-line pt-2"
                     >
                       {citations.map((url) => (
                         <li key={url}>
@@ -1187,7 +1177,7 @@ export default function ChatPage() {
                             href={url}
                             target="_blank"
                             rel="noopener noreferrer"
-                            className="block truncate text-xs text-emerald-400 hover:text-emerald-300 hover:underline"
+                            className="block truncate text-xs text-accent hover:text-accent-d hover:underline"
                           >
                             {url}
                           </a>
@@ -1205,65 +1195,65 @@ export default function ChatPage() {
           {toAnswer.length > 0 && (
             <section
               aria-labelledby="answer-heading"
-              className="mt-4 space-y-3 rounded-lg border border-neutral-800 bg-neutral-900 p-3"
+              className="mt-6 space-y-3 rounded-xl border border-line bg-bg-subtle p-4"
             >
-          <h2
-            id="answer-heading"
-            className="text-xs font-semibold uppercase tracking-widest text-neutral-500"
-          >
-            Approved — send an answer
-          </h2>
-          <ul className="space-y-3">
-            {toAnswer.map((item) => (
-              <li
-                key={item.correlation_id}
-                className="space-y-2 rounded-lg border border-neutral-800 bg-neutral-950 p-3"
+              <h2
+                id="answer-heading"
+                className="text-xs font-semibold uppercase tracking-widest text-ink-3"
               >
-                <p className="font-mono text-[11px] text-neutral-500">
-                  to {item.requester} · {item.correlation_id}
-                </p>
-                <label
-                  htmlFor={`answer-${item.correlation_id}`}
-                  className="sr-only"
-                >
-                  Answer
-                </label>
-                <textarea
-                  id={`answer-${item.correlation_id}`}
-                  value={answerText[item.correlation_id] ?? ""}
-                  onChange={(e) =>
-                    setAnswerText((prev) => ({
-                      ...prev,
-                      [item.correlation_id]: e.target.value,
-                    }))
-                  }
-                  placeholder="Type the answer…"
-                  rows={2}
-                  disabled={answering === item.correlation_id}
-                  className="w-full resize-none rounded-md border border-neutral-700 bg-neutral-950 px-3 py-2 text-sm text-neutral-200 placeholder:text-neutral-600 focus:border-emerald-600 focus:outline-none focus:ring-2 focus:ring-emerald-600/40 disabled:cursor-not-allowed disabled:opacity-50"
-                />
-                <button
-                  type="button"
-                  onClick={() => void sendAnswer(item.correlation_id)}
-                  disabled={
-                    answering === item.correlation_id ||
-                    (answerText[item.correlation_id] ?? "").trim().length === 0
-                  }
-                  className="inline-flex items-center justify-center rounded-md bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-500 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/50 disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  {answering === item.correlation_id
-                    ? "Sending…"
-                    : "Send answer"}
-                </button>
-              </li>
-            ))}
-            </ul>
-          </section>
+                Approved — send an answer
+              </h2>
+              <ul className="space-y-3">
+                {toAnswer.map((item) => (
+                  <li
+                    key={item.correlation_id}
+                    className="space-y-2 rounded-lg border border-line bg-bg p-3"
+                  >
+                    <p className="font-mono text-[11px] text-ink-3">
+                      to {item.requester} · {item.correlation_id}
+                    </p>
+                    <label
+                      htmlFor={`answer-${item.correlation_id}`}
+                      className="sr-only"
+                    >
+                      Answer
+                    </label>
+                    <textarea
+                      id={`answer-${item.correlation_id}`}
+                      value={answerText[item.correlation_id] ?? ""}
+                      onChange={(e) =>
+                        setAnswerText((prev) => ({
+                          ...prev,
+                          [item.correlation_id]: e.target.value,
+                        }))
+                      }
+                      placeholder="Type the answer…"
+                      rows={2}
+                      disabled={answering === item.correlation_id}
+                      className="w-full resize-none rounded-lg border border-line bg-bg px-3 py-2 text-sm text-ink placeholder:text-ink-3 focus:border-accent focus:outline-none focus:ring-2 focus:ring-accent/20 disabled:cursor-not-allowed disabled:opacity-50"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => void sendAnswer(item.correlation_id)}
+                      disabled={
+                        answering === item.correlation_id ||
+                        (answerText[item.correlation_id] ?? "").trim().length === 0
+                      }
+                      className="inline-flex items-center justify-center rounded-lg bg-accent px-4 py-2 text-sm font-medium text-white hover:bg-accent-d focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/50 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      {answering === item.correlation_id
+                        ? "Sending…"
+                        : "Send answer"}
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </section>
           )}
         </main>
 
-        <footer className="sticky bottom-0 z-20 border-t border-neutral-800 bg-neutral-950 px-3 pb-4 pt-2 sm:px-4">
-          <div className="mx-auto w-full max-w-3xl space-y-2">
+        <footer className="sticky bottom-0 z-20 border-t border-line bg-bg px-4 pb-4 pt-3 sm:px-6">
+          <div className="mx-auto w-full max-w-3xl space-y-3">
             <section aria-labelledby="stream-heading">
               <h2 id="stream-heading" className="sr-only">
                 Live search
@@ -1286,7 +1276,7 @@ export default function ChatPage() {
                     placeholder="Ask live… (web answer with sources)"
                     rows={1}
                     disabled={streaming || askBusy}
-                    className="w-full resize-none rounded-full border border-neutral-800 bg-neutral-900 px-3 py-1.5 text-sm text-neutral-200 placeholder:text-neutral-600 focus:border-emerald-600 focus:outline-none focus:ring-2 focus:ring-emerald-600/40 disabled:cursor-not-allowed disabled:opacity-50"
+                    className="w-full resize-none rounded-2xl border border-line bg-bg px-4 py-2.5 text-sm text-ink placeholder:text-ink-3 focus:border-accent focus:outline-none focus:ring-2 focus:ring-accent/20 disabled:cursor-not-allowed disabled:opacity-50"
                   />
                 </div>
                 <button
@@ -1294,88 +1284,120 @@ export default function ChatPage() {
                   disabled={
                     streaming || askBusy || streamInput.trim().length === 0
                   }
-                  className="inline-flex shrink-0 items-center justify-center rounded-full border border-neutral-700 bg-neutral-950 px-3 py-1.5 text-xs font-medium text-neutral-200 hover:border-emerald-700 hover:text-emerald-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/50 disabled:cursor-not-allowed disabled:opacity-50"
+                  className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-accent text-white hover:bg-accent-d focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/50 disabled:cursor-not-allowed disabled:opacity-50"
                 >
-                  {streaming ? "Streaming…" : "Ask live"}
+                  {streaming ? (
+                    <span aria-hidden="true" className="text-sm leading-none">
+                      …
+                    </span>
+                  ) : (
+                    <svg
+                      aria-hidden="true"
+                      width="16"
+                      height="16"
+                      viewBox="0 0 16 16"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    >
+                      <line x1="8" y1="14" x2="8" y2="2" />
+                      <polyline points="3 7 8 2 13 7" />
+                    </svg>
+                  )}
+                  <span className="sr-only">
+                    {streaming ? "Streaming…" : "Ask live"}
+                  </span>
                 </button>
               </form>
             </section>
 
             <section
               aria-labelledby="ask-heading"
-              className="rounded-2xl border border-neutral-700 bg-neutral-900 p-2 focus-within:border-emerald-600 focus-within:ring-2 focus-within:ring-emerald-600/40"
+              className="rounded-2xl border border-line bg-bg p-2 shadow-sm focus-within:border-accent focus-within:ring-2 focus-within:ring-accent/20"
             >
               <h2 id="ask-heading" className="sr-only">
                 Ask
               </h2>
               {peers.length === 0 ? (
-          <p className="text-sm text-neutral-500">
-            No paired peers yet. Pair one first.
-          </p>
-        ) : (
-            <div className="flex items-end gap-2">
-              <div className="flex-1">
-                <label htmlFor="question-box" className="sr-only">
-                  Message
-                </label>
-                <textarea
-                  id="question-box"
-                  value={question}
-                  onChange={(e) => setQuestion(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" && !e.shiftKey) {
-                      e.preventDefault();
-                      void sendAsk();
+                <p className="px-3 py-2 text-sm text-ink-3">
+                  No paired peers yet. Pair one first.
+                </p>
+              ) : (
+                <div className="flex items-end gap-2">
+                  <div className="flex-1">
+                    <label htmlFor="question-box" className="sr-only">
+                      Message
+                    </label>
+                    <textarea
+                      id="question-box"
+                      value={question}
+                      onChange={(e) => setQuestion(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" && !e.shiftKey) {
+                          e.preventDefault();
+                          void sendAsk();
+                        }
+                      }}
+                      placeholder="Message… (Enter to send, Shift+Enter for a new line)"
+                      rows={2}
+                      disabled={askBusy || streaming}
+                      className="w-full resize-none bg-transparent px-3 py-2 text-sm text-ink placeholder:text-ink-3 focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
+                    />
+                  </div>
+                  <button
+                    type="button"
+                    onClick={sendAsk}
+                    disabled={
+                      askBusy ||
+                      streaming ||
+                      !peerId ||
+                      question.trim().length === 0
                     }
-                  }}
-                  placeholder="Message… (Enter to send, Shift+Enter for a new line)"
-                  rows={2}
-                  disabled={askBusy || streaming}
-                  className="w-full resize-none bg-transparent px-3 py-2 text-sm text-neutral-200 placeholder:text-neutral-600 focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
-                />
-              </div>
-              <button
-                type="button"
-                onClick={sendAsk}
-                disabled={
-                  askBusy ||
-                  streaming ||
-                  !peerId ||
-                  question.trim().length === 0
-                }
-                aria-label="Send message"
-                className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-emerald-600 text-white hover:bg-emerald-500 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/50 disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                {askBusy ? (
-                  <span aria-hidden="true" className="text-sm leading-none">
-                    …
-                  </span>
-                ) : (
-                  <svg
-                    aria-hidden="true"
-                    width="16"
-                    height="16"
-                    viewBox="0 0 16 16"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="2"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
+                    aria-label="Send message"
+                    className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-accent text-white hover:bg-accent-d focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/50 disabled:cursor-not-allowed disabled:opacity-50"
                   >
-                    <line x1="8" y1="14" x2="8" y2="2" />
-                    <polyline points="3 7 8 2 13 7" />
-                  </svg>
-                )}
-                <span className="sr-only">
-                  {askBusy ? "Sending…" : "Send"}
-                </span>
-              </button>
-              </div>
+                    {askBusy ? (
+                      <span aria-hidden="true" className="text-sm leading-none">
+                        …
+                      </span>
+                    ) : (
+                      <svg
+                        aria-hidden="true"
+                        width="16"
+                        height="16"
+                        viewBox="0 0 16 16"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                      >
+                        <line x1="8" y1="14" x2="8" y2="2" />
+                        <polyline points="3 7 8 2 13 7" />
+                      </svg>
+                    )}
+                    <span className="sr-only">
+                      {askBusy ? "Sending…" : "Send"}
+                    </span>
+                  </button>
+                </div>
               )}
             </section>
           </div>
         </footer>
       </div>
     </div>
+  );
+}
+
+export default function ChatPage() {
+  return (
+    <Suspense
+      fallback={<div className="p-8 text-sm text-ink-3">Loading…</div>}
+    >
+      <ChatInner />
+    </Suspense>
   );
 }

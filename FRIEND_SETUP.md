@@ -51,10 +51,21 @@ docker logs nexus
 
 You should see `Uvicorn running` and no Traceback.
 
-## 3. Paste your model key in the app
+## 3. Unlock the app with your operator token
 
-1. Open **http://localhost:3001/chat**.
-2. At the top, in **Model key**, paste your Gemini key → **Save key**.
+1. Open **http://localhost:3001/chat**. A yellow banner asks for an
+   operator token (the app's API refuses to work without it).
+2. Get the token (it was created automatically on first start):
+   ```powershell
+   docker exec nexus cat /data/operator_token
+   ```
+3. Paste it into the banner → **Unlock**. It stays in your browser.
+   If you ever rotate it, repeat this step with the new value.
+
+## 4. Paste your model key in the app
+
+1. At the top, in **Model key**, pick **Google Gemini**, paste your
+   Gemini key → **Save key**.
 3. The key is checked live before it is saved: a bad key is rejected
    with the provider's message and never stored. When it says
    **Configured**, say hi to your agent.
@@ -66,14 +77,14 @@ Manual live check (proves the saved key works end to end): after
 answer with sources. If chat says the key is missing instead, re-paste
 it and try again.
 
-## 4. Pair with me
+## 5. Pair with me
 
 1. I create an invite and READ YOU the code over a call (never chat/email).
 2. People page → enter it within 15 minutes.
 3. Compare the fingerprint on your screen with mine, character by character.
 4. Both approve → we're connected.
 
-## 5. Daily use
+## 6. Daily use
 
 - Open http://localhost:3001/chat. Start Docker first if it was closed.
 - Your data (identity + memories + model key) lives in the `nexus-data`

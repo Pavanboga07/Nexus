@@ -10,6 +10,7 @@ from __future__ import annotations
 import time
 
 from app.llm.provider import SYSTEM_PROMPT
+from tests.conftest import auth_headers
 
 AT = "2026-09-22T09:00:00+00:00"
 
@@ -44,7 +45,7 @@ def _stream_client(monkeypatch, db, seen):
         lambda: make_provider(post_stream_fn=source),
     )
     monkeypatch.setattr(chat_route, "build_tools", lambda: {})
-    return TestClient(app)
+    return TestClient(app, headers=auth_headers())
 
 
 def test_recall_session_scope_filters_store(tmp_path):

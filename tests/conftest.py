@@ -14,6 +14,23 @@ import pytest
 # Relay imports are lazy (inside fixtures/helpers in tests/relay_db.py) so
 # this conftest never breaks collection when relay modules do not exist yet.
 
+#: Operator bearer token pinned for HTTP tests (the middleware resolves
+#: it from env). Tests asserting unauthenticated behavior must override
+#: or delete this env var and send no (or wrong) credentials.
+TEST_OPERATOR_TOKEN = "test-operator-token"
+
+
+@pytest.fixture(scope="function", autouse=True)
+def _pin_operator_token(monkeypatch):
+    """Authenticate every TestClient by default; files testing auth
+    itself clear or override the env in their own fixtures."""
+    monkeypatch.setenv("NEXUS_OPERATOR_TOKEN", TEST_OPERATOR_TOKEN)
+
+
+def auth_headers(token: str = TEST_OPERATOR_TOKEN) -> dict[str, str]:
+    """Default Authorization headers for TestClient construction."""
+    return {"Authorization": f"Bearer {token}"}
+
 
 @pytest.fixture(scope="function")
 def relay_engine():

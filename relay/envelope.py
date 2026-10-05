@@ -52,6 +52,13 @@ TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 ERROR_TTL_SECONDS = 300
 
 
+#: Maximum accepted clock skew for envelope timestamps: a timestamp
+#: further than this in the future is rejected (replay/future-dating
+#: protection). Legitimate NTP drift is seconds; anything beyond five
+#: minutes is either attack or a broken clock worth failing loudly on.
+CLOCK_SKEW_SECONDS = 300
+
+
 class CanonicalizationError(TypeError):
     """A value cannot be canonically serialized (floats, NaN, odd types)."""
 
@@ -192,6 +199,11 @@ class Envelope(BaseModel):
         """Validate schema AND the live time window (rejects expired)."""
         env = cls.model_validate(raw)
         at = parse_iso(now) if now is not None else datetime.now(timezone.utc)
+        if (parse_iso(env.timestamp) - at).total_seconds() > CLOCK_SKEW_SECONDS:
+            raise EnvelopeError(
+                "FUTURE_TIMESTAMP",
+                "envelope timestamp is beyond the clock-skew window",
+            )
         if parse_iso(env.expires_at) <= at:
             raise EnvelopeError("EXPIRED", "envelope expires_at is past")
         if parse_iso(env.expires_at) <= parse_iso(env.timestamp):

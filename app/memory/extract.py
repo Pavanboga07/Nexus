@@ -57,6 +57,7 @@ def record_turn(
     created_at: str = "",
     background: bool = True,
     extractor: Extractor | None = None,
+    agent_id: str = "",
 ) -> threading.Thread:
     """Store extracted facts; always returns the worker thread.
 
@@ -66,17 +67,18 @@ def record_turn(
     failures are isolated from chat.
     """
     extract = extractor or _default_extractor
+    owner = agent_id or ""
     if background:
         thread = threading.Thread(
             target=_run,
             args=(str(db_path), user_text, assistant_text, session_id,
-                  created_at, extract),
+                  created_at, extract, owner),
             daemon=True,
         )
         thread.start()
         return thread
     _run(str(db_path), user_text, assistant_text, session_id, created_at,
-         extract)
+         extract, owner)
     done = threading.Thread(target=lambda: None, daemon=True)
     done.start()
     return done
@@ -89,19 +91,24 @@ def queue_extraction(
     session_id: str = "",
     created_at: str = "",
     extractor: Extractor | None = None,
+    agent_id: str = "",
 ) -> threading.Thread:
     """Alias for ``record_turn(background=True)`` — the chat hook entry."""
     return record_turn(
         db_path, user_text, assistant_text, session_id, created_at,
-        background=True, extractor=extractor,
+        background=True, extractor=extractor, agent_id=agent_id,
     )
 
 
 def _run(db_path, user_text, assistant_text, session_id, created_at,
-         extract) -> None:
+         extract, agent_id="") -> None:
+    import logging
+
+    log = logging.getLogger("nexus.extract")
     try:
         facts = extract(user_text, assistant_text) or []
-    except Exception:
+    except Exception as exc:
+        log.warning("extraction failed: %s", type(exc).__name__)
         return
     if not facts:
         return
@@ -110,10 +117,13 @@ def _run(db_path, user_text, assistant_text, session_id, created_at,
 
         store = MemoryStore(db_path)
         try:
-            store.add_many(facts, session_id=session_id, created_at=created_at)
+            store.add_many(facts, session_id=session_id,
+                             created_at=created_at,
+                             agent_id=agent_id or "default")
         finally:
             store.close()
-    except Exception:
+    except Exception as exc:
+        log.warning("extraction store failed: %s", type(exc).__name__)
         return
 
 

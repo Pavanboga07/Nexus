@@ -560,11 +560,13 @@ def test_tool_choice_payload_behavior():
     assert "tool_choice" not in payloads[0]
 
 
-def test_sse_error_mapping_for_provider_faults(monkeypatch):
-    """Typed provider faults reach SSE as coded error events."""
-    import app.api.routes.chat as chat_route
+def test_sse_error_mapping_for_provider_faults(monkeypatch, tmp_path):
+    """Typed provider faults reach the turn event stream as coded errors."""
+    import asyncio
 
-    monkeypatch.setattr(chat_route, "_extract_after_turn", lambda *a: None)
+    from app.agent.graph import build_graph, run_turn
+
+    monkeypatch.setenv("NEXUS_DB_PATH", str(tmp_path / "faults.db"))
 
     async def timeout_source(payload):
         raise httpx.ConnectTimeout("slow")
@@ -575,7 +577,22 @@ def test_sse_error_mapping_for_provider_faults(monkeypatch):
         yield {"content": "never"}  # pragma: no cover - generator marker
 
     async def collect(provider):
-        return [e async for e in chat_route._events("hi", provider, {})]
+        import json
+
+        queue: asyncio.Queue = asyncio.Queue()
+        graph = build_graph()
+        await run_turn(
+            graph,
+            thread_id="faults",
+            message="hi",
+            provider=provider,
+            tools={},
+            sink=queue,
+        )
+        events = []
+        while not queue.empty():
+            events.append(queue.get_nowait())
+        return [f"data: {json.dumps(e)}" for e in events]
 
     events = run(collect(make_provider(post_stream_fn=timeout_source)))
     assert '"type": "error"' in events[-1]

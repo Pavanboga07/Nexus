@@ -14,6 +14,7 @@ import os
 
 import pytest
 from fastapi.testclient import TestClient
+from tests.conftest import auth_headers
 
 
 @pytest.fixture
@@ -109,7 +110,7 @@ def test_settings_bad_key_rejected_without_storing(isolated_db, monkeypatch):
         )
 
     monkeypatch.setattr(settings_route, "verify_llm_key", _boom)
-    client = TestClient(app)
+    client = TestClient(app, headers=auth_headers())
     resp = client.post("/settings/llm-key", json={"key": "bad-key"})
     assert resp.status_code == 401
     assert "bad key" in resp.json()["detail"]
@@ -130,7 +131,7 @@ def test_settings_good_key_stored_and_status_hides_value(
     monkeypatch.setattr(
         settings_route, "verify_llm_key", lambda key, base_url, timeout=10.0: None
     )
-    client = TestClient(app)
+    client = TestClient(app, headers=auth_headers())
     resp = client.post("/settings/llm-key", json={"key": "good-key"})
     assert resp.status_code == 200
     assert resp.json() == {"ok": True}
@@ -147,7 +148,7 @@ def test_settings_good_key_stored_and_status_hides_value(
 def test_settings_empty_key_rejected(isolated_db):
     from app.main import app
 
-    client = TestClient(app)
+    client = TestClient(app, headers=auth_headers())
     resp = client.post("/settings/llm-key", json={"key": "   "})
     assert resp.status_code == 400
 
@@ -165,7 +166,7 @@ def test_pairing_invite_auto_initializes_without_env_secret(
     monkeypatch.delenv("NEXUS_RELAY_URL", raising=False)
     from app.main import app
 
-    client = TestClient(app)
+    client = TestClient(app, headers=auth_headers())
     resp = client.post("/pairing/invites", json={})
     body = resp.json()
     assert body.get("code") != "NO_IDENTITY", body
