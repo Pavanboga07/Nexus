@@ -55,9 +55,9 @@ You should see `Uvicorn running` and no Traceback.
 
 1. Open **http://localhost:3001/chat**. A yellow banner asks for an
    operator token (the app's API refuses to work without it).
-2. Get the token (it was created automatically on first start):
+2. Get the token (created on first start):
    ```powershell
-   docker exec nexus cat /data/operator_token
+   docker exec nexus python -c "from app.machine_config import get_or_create_operator_token; print(get_or_create_operator_token()[0])"
    ```
 3. Paste it into the banner → **Unlock**. It stays in your browser.
    If you ever rotate it, repeat this step with the new value.
