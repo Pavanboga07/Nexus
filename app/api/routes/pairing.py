@@ -61,14 +61,21 @@ def get_conn():
 
 
 def _relay_base() -> str:
-    base = os.environ.get("NEXUS_RELAY_URL", "")
-    if not base:
+    raw = os.environ.get("NEXUS_RELAY_URL", "").strip()
+    if not raw:
         raise PairingError(
             "NO_RELAY",
             "relay is not configured (set NEXUS_RELAY_URL).",
             status=503,
         )
-    return base
+    # NEXUS_RELAY_URL is the WS(S) URL (the delivery path needs it), but
+    # pairing talks plain HTTPS: normalize the scheme here instead of
+    # POSTing to a wss:// URL (the relay 500s those).
+    if raw.startswith("wss://"):
+        return "https://" + raw[len("wss://"):]
+    if raw.startswith("ws://"):
+        return "http://" + raw[len("ws://"):]
+    return raw
 
 
 def _local_agent_id(conn: sqlite3.Connection) -> str:
