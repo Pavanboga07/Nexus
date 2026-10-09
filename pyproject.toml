@@ -1,0 +1,17 @@
+# Findings C1/D2: the repo had 20+ `# noqa: BLE001` comments but zero linter
+# config. This file makes the lint rules explicit and CI-enforceable.
+[project]
+name = "nexus"
+version = "0.1.0"
+description = "Nexus — personal AI assistant with an agent-to-agent network"
+requires-python = ">=3.12"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+# E9: syntax errors. F401/F821: unused imports, undefined names.
+# BLE001 (blind `except Exception`): every such handler must log or
+# re-raise — silent swallows are the finding C1 smell. The pre-existing
+# `# noqa: BLE001` comments mark the intentional, logged ones.
+lint.select = ["E9", "F401", "F821", "BLE001"]
+lint.ignore = []

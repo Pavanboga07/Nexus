@@ -18,14 +18,6 @@ export function setOperatorToken(token: string): void {
   }
 }
 
-export function clearOperatorToken(): void {
-  try {
-    localStorage.removeItem(TOKEN_KEY);
-  } catch {
-    /* best-effort */
-  }
-}
-
 /** Authorization header for API calls; empty object when no token saved. */
 export function authHeaders(): Record<string, string> {
   const token = getOperatorToken();
