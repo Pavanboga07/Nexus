@@ -18,23 +18,55 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 import uuid
+from collections import deque
 from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
+from sqlalchemy import func, select
 
 from relay import auth, directory, invites, presence, queue
 from relay.db import check_ready, init_and_verify, make_engine, make_session_factory, resolve_database_url
 from relay.envelope import Envelope, EnvelopeError
+from relay.models import Invite
 
 logger = logging.getLogger("relay")
 
 WS_CLOSE_UNAUTHORIZED = 4401
+WS_CLOSE_POLICY = 4408
 ACK_TIMEOUT_DEFAULT = 5.0
 DIRECTORY_RATE_LIMIT_DEFAULT = 60
+# m3: pre-auth handshake hardening on /ws.
+WS_HANDSHAKE_TIMEOUT = 10.0
+WS_PREAUTH_MAX_ATTEMPTS = 30
+WS_PREAUTH_WINDOW_SECONDS = 60.0
+WS_MAX_HALF_OPEN = 128
+
+
+_pre_auth_attempts: dict[str, deque[float]] = {}
+_half_open_handshakes = asyncio.Semaphore(WS_MAX_HALF_OPEN)
+
+
+def _pre_auth_allowed(ip: str) -> bool:
+    """Per-IP token bucket for /ws pre-auth (m3).
+
+    Every handshake costs Postgres DELETE+INSERT+commit before any
+    authentication, so bound unauthenticated attempts per IP.
+    """
+    now = time.monotonic()
+    hits = _pre_auth_attempts.get(ip)
+    if hits is None:
+        hits = _pre_auth_attempts[ip] = deque()
+    while hits and hits[0] <= now - WS_PREAUTH_WINDOW_SECONDS:
+        hits.popleft()
+    if len(hits) >= WS_PREAUTH_MAX_ATTEMPTS:
+        return False
+    hits.append(now)
+    return True
 
 
 def log_event(event: str, correlation_id: str | None = None, **fields) -> None:
@@ -134,7 +166,7 @@ def create_relay_app(
         try:
             ip = request.client.host if request.client else "unknown"
             async with Session() as session:
-                await directory.check_rate_limit(session, ip, limit=directory_rate_limit)
+                await directory.enforce_rate_limit(session, ip, limit=directory_rate_limit)
                 if not isinstance(card, dict) or (card.get("agent_id") != agent_id):
                     raise directory.DirectoryError(400, "PATH_MISMATCH", "card agent_id must match the request path")
                 await directory.store_entry(session, card)
@@ -187,8 +219,19 @@ def create_relay_app(
             return JSONResponse(status_code=exc.status, content={"detail": str(exc), "code": exc.code})
         return {"card": card}
 
+    def _purge_expired_acks() -> None:
+        # F11: ack deadline. Entries whose recipient never acked (dead
+        # socket, lost client) are dropped; the DB row stays pending so a
+        # later flush redelivers, attempts-bounded toward the DLQ.
+        now = time.monotonic()
+        for delivery_id in [did for did, entry in pending_acks.items() if entry["deadline"] <= now]:
+            pending_acks.pop(delivery_id, None)
+
     async def settle_ack(delivery_id: str) -> bool:
-        entry = pending_acks.get(delivery_id)
+        _purge_expired_acks()
+        # F11: pop on settle. Flushed deliveries were tracked but never
+        # removed here, leaking one dict entry per acked message.
+        entry = pending_acks.pop(delivery_id, None)
         if entry is None:
             return False
         async with Session() as session:
@@ -198,9 +241,10 @@ def create_relay_app(
         entry["event"].set()
         return True
 
-    def track_delivery(delivery_id: str, message_id: str, sender_ws: WebSocket | None, sender_relay_id: str | None) -> asyncio.Event:
+    def track_delivery(delivery_id: str, message_id: str, sender_ws: WebSocket | None, sender_relay_id: str | None, *, agent_id: str) -> asyncio.Event:
+        _purge_expired_acks()
         event = asyncio.Event()
-        pending_acks[delivery_id] = {"event": event, "message_id": message_id, "sender_ws": sender_ws, "sender_relay_id": sender_relay_id}
+        pending_acks[delivery_id] = {"event": event, "message_id": message_id, "sender_ws": sender_ws, "sender_relay_id": sender_relay_id, "agent_id": agent_id, "deadline": time.monotonic() + ack_timeout}
         return event
 
     async def flush_pending(agent_id: str, ws: WebSocket) -> None:
@@ -209,11 +253,35 @@ def create_relay_app(
             await session.commit()
         for row in rows:
             delivery_id = f"dlv_{uuid.uuid4().hex}"
-            track_delivery(delivery_id, row["message_id"], None, None)
+            track_delivery(delivery_id, row["message_id"], None, None, agent_id=agent_id)
             try:
                 await ws.send_json({"type": "delivery", "relay_id": delivery_id, "envelope": row["envelope"]})
             except Exception:
+                pending_acks.pop(delivery_id, None)
                 break
+
+    async def _recipient_routable(session, recipient: str) -> bool:
+        """True when the recipient could ever receive: connected now, has a
+        directory card, has authenticated here before (presence rows survive
+        disconnect), or has an open invite published. Anything else (e.g. a
+        sub-agent address nothing ever authenticates as) is failed fast with
+        NOT_SUPPORTED instead of being queued into a black hole (F3)."""
+        if live_sockets.get(recipient) is not None:
+            return True
+        if await directory.get_entry(session, recipient) is not None:
+            return True
+        if await presence.get_presence(session, recipient) is not None:
+            return True
+        invite = (
+            await session.execute(
+                select(Invite).where(
+                    Invite.agent_id == recipient,
+                    Invite.used.is_(False),
+                    Invite.expires_at > func.now(),
+                )
+            )
+        ).scalar_one_or_none()
+        return invite is not None
 
     async def handle_envelope(ws: WebSocket, agent_id: str, frame: dict[str, Any]) -> None:
         sender_relay_id = frame.get("relay_id")
@@ -233,20 +301,38 @@ def create_relay_app(
             return
         envelope = env.model_dump(exclude_none=True)
         async with Session() as session:
+            # F3: never queue for an address that can never receive. A
+            # sub-agent id has no live socket, no directory card, no prior
+            # session and no open invite: fail fast instead of black-holing.
+            if live_sockets.get(env.recipient) is None and not await _recipient_routable(session, env.recipient):
+                await ws.send_json({"type": "error", "code": "NOT_SUPPORTED", "message": "recipient is unknown here: not connected, no directory card, no prior session, no open invite. Sub-agent addresses are not routable; have the owning identity connect first.", "correlation_id": correlation_id})
+                return
             try:
                 outcome = await queue.enqueue(session, envelope=envelope)
+            except queue.QueueFullError as exc:
+                # F10: loud backpressure, not silent DLQ eviction.
+                await session.rollback()
+                log_event("enqueue_rejected_queue_full", correlation_id, recipient=env.recipient)
+                await ws.send_json({"type": "error", "code": "QUEUE_FULL", "message": str(exc), "correlation_id": correlation_id})
+                return
             except ValueError as exc:
                 await session.rollback()
                 await ws.send_json({"type": "error", "code": "INVALID_ENVELOPE", "message": str(exc), "correlation_id": correlation_id})
                 return
             await session.commit()
         log_event("envelope_queued", correlation_id, message_id=env.message_id, outcome=outcome)
+        if outcome == "dedup_hit":
+            # F9: this message_id was already accepted. The recipient either
+            # has it or will get it via redelivery — do NOT live-forward
+            # again (the app layer would reject the duplicate as REPLAY).
+            await ws.send_json({"type": "delivery_ack", "relay_id": sender_relay_id, "status": "queued"})
+            return
         target = live_sockets.get(env.recipient)
         if target is None:
             await ws.send_json({"type": "delivery_ack", "relay_id": sender_relay_id, "status": "queued"})
             return
         delivery_id = f"dlv_{uuid.uuid4().hex}"
-        event = track_delivery(delivery_id, env.message_id, ws, sender_relay_id)
+        event = track_delivery(delivery_id, env.message_id, ws, sender_relay_id, agent_id=env.recipient)
         try:
             await target.send_json({"type": "delivery", "relay_id": delivery_id, "envelope": envelope, "correlation_id": correlation_id})
         except Exception:
@@ -264,28 +350,52 @@ def create_relay_app(
     @app.websocket("/ws")
     async def relay_socket(ws: WebSocket):
         await ws.accept()
+        ip = ws.client.host if ws.client else "unknown"
+        # m3: per-IP pre-auth token bucket. Each handshake costs Postgres
+        # DELETE+INSERT+commit before any authentication happens.
+        if not _pre_auth_allowed(ip):
+            log_event("ws_preauth_rate_limited", ip=ip)
+            await ws.send_json({"type": "error", "code": "RATE_LIMITED", "message": "too many connection attempts; slow down"})
+            await ws.close(code=WS_CLOSE_POLICY)
+            return
         correlation_id = _new_correlation_id()
         agent_id: str | None = None
         try:
-            async with Session() as session:
-                challenge_b64 = await auth.mint_challenge(session)
-                await session.commit()
-            await ws.send_json({"type": "auth_challenge", "challenge": challenge_b64, "correlation_id": correlation_id})
-            frame = await ws.receive_json()
-            if not isinstance(frame, dict) or (frame.get("type") != "auth_response"):
-                await ws.send_json({"type": "error", "code": "UNAUTHENTICATED", "message": "first frame must be auth_response", "correlation_id": correlation_id})
-                await ws.close(code=WS_CLOSE_UNAUTHORIZED)
-                return
-            try:
+            # m3: cap half-open (accepted but unauthenticated) handshakes.
+            async with _half_open_handshakes:
                 async with Session() as session:
-                    agent_id = await auth.verify_and_consume(session, challenge_b64=frame.get("challenge", challenge_b64), agent_id=frame.get("agent_id", ""), public_key_b64=frame.get("public_key", ""), signature_b64=frame.get("signature", ""))
+                    challenge_b64 = await auth.mint_challenge(session)
                     await session.commit()
-            except auth.AuthError as exc:
-                counters["auth_failures"] += 1
-                log_event("auth_failed", correlation_id, code=exc.code, agent_id=frame.get("agent_id"))
-                await ws.send_json({"type": "auth_result", "success": False, "code": exc.code, "message": str(exc), "correlation_id": correlation_id})
-                await ws.close(code=WS_CLOSE_UNAUTHORIZED)
-                return
+                await ws.send_json({"type": "auth_challenge", "challenge": challenge_b64, "correlation_id": correlation_id})
+                try:
+                    # m3: handshake timeout on the first frame.
+                    frame = await asyncio.wait_for(ws.receive_json(), timeout=WS_HANDSHAKE_TIMEOUT)
+                except asyncio.TimeoutError:
+                    await ws.send_json({"type": "error", "code": "HANDSHAKE_TIMEOUT", "message": "no auth_response within the handshake window", "correlation_id": correlation_id})
+                    await ws.close(code=WS_CLOSE_UNAUTHORIZED)
+                    return
+                if not isinstance(frame, dict) or (frame.get("type") != "auth_response"):
+                    await ws.send_json({"type": "error", "code": "UNAUTHENTICATED", "message": "first frame must be auth_response", "correlation_id": correlation_id})
+                    await ws.close(code=WS_CLOSE_UNAUTHORIZED)
+                    return
+                # M1: verify against the challenge THIS connection minted.
+                # The frame's `challenge` field is ignored: honoring a
+                # client-supplied challenge breaks the auth binding (a
+                # network observer could race a victim's in-flight
+                # auth_response and authenticate as them on non-TLS).
+                presented = frame.get("challenge")
+                if presented not in (None, challenge_b64):
+                    log_event("auth_challenge_mismatch", correlation_id, agent_id=frame.get("agent_id"))
+                try:
+                    async with Session() as session:
+                        agent_id = await auth.verify_and_consume(session, challenge_b64=challenge_b64, agent_id=frame.get("agent_id", ""), public_key_b64=frame.get("public_key", ""), signature_b64=frame.get("signature", ""))
+                        await session.commit()
+                except auth.AuthError as exc:
+                    counters["auth_failures"] += 1
+                    log_event("auth_failed", correlation_id, code=exc.code, agent_id=frame.get("agent_id"))
+                    await ws.send_json({"type": "auth_result", "success": False, "code": exc.code, "message": str(exc), "correlation_id": correlation_id})
+                    await ws.close(code=WS_CLOSE_UNAUTHORIZED)
+                    return
             live_sockets[agent_id] = ws
             log_event("auth_ok", correlation_id, agent_id=agent_id)
             await ws.send_json({"type": "auth_result", "success": True, "agent_id": agent_id, "correlation_id": correlation_id})
@@ -314,6 +424,12 @@ def create_relay_app(
         finally:
             if agent_id is not None and live_sockets.get(agent_id) is ws:
                 del live_sockets[agent_id]
+            # F11: drop this connection's unacked deliveries so entries for
+            # a dead recipient don't leak (DB rows stay pending and are
+            # redelivered on the next flush, attempts-bounded to the DLQ).
+            if agent_id is not None:
+                for delivery_id in [did for did, entry in pending_acks.items() if entry.get("agent_id") == agent_id]:
+                    pending_acks.pop(delivery_id, None)
             log_event("socket_closed", correlation_id, agent_id=agent_id)
     return app
 

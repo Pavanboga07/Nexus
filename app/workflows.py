@@ -16,19 +16,20 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sqlite3
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Callable
 
+from app import orchestration, tasks
+from app.errors import NexusError
 
-class WorkflowError(RuntimeError):
+logger = logging.getLogger(__name__)
+
+
+class WorkflowError(NexusError):
     """Workflow failure with machine ``code`` + HTTP ``status``."""
-
-    def __init__(self, code: str, message: str, status: int | None = None):
-        super().__init__(f"{code}: {message}")
-        self.code = code
-        self.status = status
 
 
 def _now() -> str:
@@ -203,7 +204,7 @@ async def _safe_run_step(conn_factory: Callable, flow_id: str,
     try:
         return await _run_step(conn_factory, flow_id, step,
                                requesting_agent)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - recorded on the step row
         conn = conn_factory()
         try:
             with conn:
@@ -223,8 +224,6 @@ async def _run_step(conn_factory: Callable, flow_id: str, step: dict,
     BLOCK only on failed siblings; incomplete ones defer (stay
     PENDING) for a later run.
     """
-    from app import orchestration, tasks
-
     conn = conn_factory()
     try:
         with conn:
@@ -392,8 +391,6 @@ def on_task_settled(conn: sqlite3.Connection, task_id: str) -> None:
     the linked step and re-closes the workflow; no-ops when the task
     backs no step.
     """
-    from app import tasks
-
     try:
         task = tasks.get_task(conn, task_id)
     except tasks.TaskError:
@@ -463,8 +460,6 @@ def recover_workflows(conn_factory: Callable) -> list[dict[str, Any]]:
     timeouts guard anything that lingers). Flows return to PENDING for
     an explicit operator resume; nothing auto-executes on boot.
     """
-    from app import tasks as task_tracker
-
     conn = conn_factory()
     try:
         flows = [dict(r) for r in conn.execute(
@@ -483,9 +478,9 @@ def recover_workflows(conn_factory: Callable) -> list[dict[str, Any]]:
                     synced = False
                     if step["task_id"]:
                         try:
-                            task = task_tracker.get_task(
+                            task = tasks.get_task(
                                 conn, step["task_id"])
-                        except task_tracker.TaskError:
+                        except tasks.TaskError:
                             task = None
                         if task is not None and task["status"] == "COMPLETED":
                             _set_step(conn, step["step_id"], "COMPLETED",
@@ -512,8 +507,6 @@ def recover_workflows(conn_factory: Callable) -> list[dict[str, Any]]:
 
 def cancel_workflow(conn_factory: Callable, flow_id: str) -> dict[str, Any]:
     """Cancel live step tasks; blocked/pending steps go CANCELLED."""
-    from app import tasks
-
     conn = conn_factory()
     try:
         flow = get_workflow(conn, flow_id)
@@ -529,7 +522,9 @@ def cancel_workflow(conn_factory: Callable, flow_id: str) -> dict[str, Any]:
                     try:
                         tasks.cancel_task(conn, step["task_id"])
                     except tasks.TaskError:
-                        pass
+                        logger.debug("best-effort cancel of step task %r"
+                                     " dropped", step["task_id"],
+                                     exc_info=True)
                 _set_step(conn, step["step_id"], "CANCELLED")
             _set_flow(conn, flow_id, "CANCELLED")
         return get_workflow(conn, flow_id)

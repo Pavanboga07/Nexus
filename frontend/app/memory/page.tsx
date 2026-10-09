@@ -3,6 +3,15 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { API_BASE, api } from "../components/api";
 import { authHeaders } from "../components/operator";
+import {
+  EmptyState,
+  ErrorAlert,
+  LoadingSkeleton,
+  RelativeTime,
+  StatusNote,
+  secondaryButtonClass,
+  useToast,
+} from "../components/ui";
 
 type Memory = {
   id: string;
@@ -18,6 +27,7 @@ type AuditEntry = {
 };
 
 export default function MemoryPage() {
+  const notify = useToast();
   const [query, setQuery] = useState("");
   const [memories, setMemories] = useState<Memory[]>([]);
   const [loading, setLoading] = useState(true);
@@ -62,6 +72,7 @@ export default function MemoryPage() {
       await api(`/memory/${encodeURIComponent(id)}`, { method: "DELETE" });
       setMemories((prev) => prev.filter((m) => m.id !== id));
       setStatus("Forgotten. It no longer appears in recall.");
+      notify("Memory forgotten", "warning");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not forget.");
     } finally {
@@ -84,6 +95,7 @@ export default function MemoryPage() {
       setEditingId(null);
       setDraft("");
       setStatus("Memory updated.");
+      notify("Memory updated", "success");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not save.");
     } finally {
@@ -132,6 +144,7 @@ export default function MemoryPage() {
       anchor.remove();
       URL.revokeObjectURL(url);
       setStatus("Exported memories to nexus-memory.json.");
+      notify("Memories exported", "success");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not export.");
     } finally {
@@ -172,6 +185,7 @@ export default function MemoryPage() {
           body: JSON.stringify({ memories: list }),
         });
         setStatus(`Imported ${data.imported} memories.`);
+        notify(`Imported ${data.imported} memories`, "success");
         await load(query.trim() || undefined);
       } catch (err) {
         setImportError(
@@ -212,22 +226,18 @@ export default function MemoryPage() {
         </p>
       </div>
 
-      {status && (
-        <p
-          role="status"
-          aria-live="polite"
-          className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-700"
-        >
-          {status}
-        </p>
-      )}
+      {status && <StatusNote message={status} />}
       {error && (
-        <p
-          role="alert"
-          className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700"
-        >
-          {error}
-        </p>
+        <div className="space-y-2">
+          <ErrorAlert message={error} />
+          <button
+            type="button"
+            onClick={() => void load(query.trim() || undefined)}
+            className={secondaryButtonClass}
+          >
+            Retry
+          </button>
+        </div>
       )}
 
       <section
@@ -303,20 +313,23 @@ export default function MemoryPage() {
               type="button"
               onClick={bulkDelete}
               disabled={bulkBusy}
-              className="inline-flex items-center justify-center rounded-lg border border-red-200 bg-bg px-3 py-1.5 text-sm font-medium text-red-600 hover:bg-red-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-red-500/50 disabled:cursor-not-allowed disabled:opacity-50"
+              className="inline-flex items-center justify-center rounded-lg border border-danger-border bg-bg px-3 py-1.5 text-sm font-medium text-danger-text hover:bg-danger-bg focus:outline-none focus-visible:ring-2 focus-visible:ring-danger/50 disabled:cursor-not-allowed disabled:opacity-50"
             >
               {bulkBusy ? "Forgetting…" : `Forget ${selected.length} selected`}
             </button>
           )}
         </div>
         {loading ? (
-          <p aria-live="polite" className="text-sm text-ink-3">
-            Loading…
-          </p>
+          <LoadingSkeleton label="Loading memories" />
         ) : memories.length === 0 ? (
-          <p className="text-sm text-ink-3">
-            Nothing remembered yet. Chat turns store facts here.
-          </p>
+          <EmptyState
+            title={query ? "No memories match." : "Nothing remembered yet."}
+            hint={
+              query
+                ? "Try a different search — or clear it to browse everything."
+                : "Facts your agents store during chat turn up here."
+            }
+          />
         ) : (
           <ul className="divide-y divide-line">
             {memories.map((m) => (
@@ -330,7 +343,7 @@ export default function MemoryPage() {
                     checked={selected.includes(m.id)}
                     onChange={() => toggleSelect(m.id)}
                     aria-label={`Select: ${m.text.slice(0, 60)}`}
-                    className="mt-1 h-4 w-4 shrink-0 accent-[#10a37f]"
+                    className="mt-1 h-4 w-4 shrink-0 accent-accent"
                   />
                   <div className="min-w-0 flex-1 space-y-1">
                     {editingId === m.id ? (
@@ -373,8 +386,15 @@ export default function MemoryPage() {
                         <p className="text-sm leading-relaxed text-ink">
                           {m.text}
                         </p>
-                        <p className="font-mono text-[11px] text-ink-3">
-                          {m.created_at || "undated"}
+                        <p className="flex flex-wrap items-center gap-x-1 font-mono text-[11px] text-ink-3">
+                          {m.created_at ? (
+                            <RelativeTime
+                              iso={m.created_at}
+                              className="font-mono text-[11px] text-ink-3"
+                            />
+                          ) : (
+                            "undated"
+                          )}
                           {m.session_id ? ` · ${m.session_id}` : ""}
                         </p>
                       </>
@@ -398,7 +418,7 @@ export default function MemoryPage() {
                       onClick={() => forget(m.id)}
                       disabled={forgetting === m.id}
                       aria-label={`Forget: ${m.text.slice(0, 60)}`}
-                      className="inline-flex items-center justify-center rounded-lg border border-red-200 bg-bg px-3 py-1.5 text-sm font-medium text-red-600 hover:bg-red-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-red-500/50 disabled:cursor-not-allowed disabled:opacity-50"
+                      className="inline-flex items-center justify-center rounded-lg border border-danger-border bg-bg px-3 py-1.5 text-sm font-medium text-danger-text hover:bg-danger-bg focus:outline-none focus-visible:ring-2 focus-visible:ring-danger/50 disabled:cursor-not-allowed disabled:opacity-50"
                     >
                       {forgetting === m.id ? "Forgetting…" : "Forget"}
                     </button>
@@ -451,7 +471,7 @@ export default function MemoryPage() {
           </div>
         </div>
         {importError && (
-          <p role="alert" className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+          <p role="alert" className="rounded-lg border border-danger-border bg-danger-bg px-3 py-2 text-sm text-danger-text">
             {importError}
           </p>
         )}
