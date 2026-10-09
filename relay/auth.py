@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.identity import crypto
+import nexus_crypto as crypto
 from relay.models import Challenge
 
 CHALLENGE_BYTES = 32

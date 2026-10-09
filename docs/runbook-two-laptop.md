@@ -14,8 +14,8 @@ exists to make this script pass.
 
 ## 0. Deploy the relay (operator, once)
 
-1. Create a hosted Postgres (Neon free tier): note `DATABASE_URL`: `______`
-2. Deploy `relay/` to Render (free tier OK for 2 users): set `DATABASE_URL`,
+1. Create a hosted Postgres (Neon free tier): note `RELAY_DATABASE_URL`: `______`
+2. Deploy `relay/` to Render (free tier OK for 2 users): set `RELAY_DATABASE_URL`,
    note public URL: `______`
 3. `GET <url>/readyz` → 200. `GET <url>/metrics` → counters present.
 4. Record both URLs above. Old relay (if any) stays untouched as fallback.
@@ -23,9 +23,11 @@ exists to make this script pass.
 ## 1. First boot (each laptop, ~5 min)
 
 1. `pip install -r requirements.txt`, `npm --prefix frontend install`
-2. Start backend (port 8000), start frontend dev (port 3000). No `.env` needed
-   yet — app runs unconfigured.
-3. Open `http://localhost:3000/chat`. Send any message → expect the
+2. Start backend (port 8001), start frontend dev (port 3001). No `.env` needed
+   yet — app runs unconfigured. (Ports default to 8001/3001 via
+   `scripts/docker-start.sh`; `PORT_API`/`PORT_UI` override them.)
+   Pre-flight: `curl localhost:8001/health` → `{"status":"ok"}`.
+3. Open `http://localhost:3001/chat`. Send any message → expect the
    missing-key error (proves the path works before keys exist).
 4. Set model key (see README), display name. Confirm fingerprint on the
    Agent page. RECORD both fingerprints:

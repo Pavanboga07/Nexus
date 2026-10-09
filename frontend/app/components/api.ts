@@ -5,8 +5,15 @@ import { authHeaders } from "./operator";
 export const API_BASE =
   process.env.NEXT_PUBLIC_NEXUS_API ?? "/api";
 
-/** Backend host for the live-update WebSocket (rewrites don't proxy WS). */
+/** Backend host for the live-update WebSocket (rewrites don't proxy WS).
+ *
+ * `NEXT_PUBLIC_NEXUS_WS` overrides the default (build-time, inlined by
+ * Next.js — e.g. `wss://nexus.example.com`). Without it the browser dials
+ * the backend directly on the viewer's hostname, port 8001.
+ */
 export function wsBase(): string {
+  const override = process.env.NEXT_PUBLIC_NEXUS_WS;
+  if (override) return override;
   if (typeof window !== "undefined" && API_BASE.startsWith("/")) {
     const proto = window.location.protocol === "https:" ? "wss" : "ws";
     return `${proto}://${window.location.hostname}:8001`;

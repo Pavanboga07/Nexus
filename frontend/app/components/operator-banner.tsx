@@ -35,18 +35,24 @@ export default function OperatorBanner() {
   return (
     <div
       role="alert"
-      className="border-b border-amber-200 bg-amber-50 px-4 py-3"
+      className="border-b border-warning-border bg-warning-bg px-4 py-3"
     >
-      <p className="text-sm font-medium text-amber-800">
+      <p className="text-sm font-medium text-warning-text">
         This app needs your operator token.
       </p>
-      <p className="mt-0.5 text-xs text-amber-700">
+      <p className="mt-0.5 text-xs text-warning-text">
         Find it with{" "}
-        <code className="rounded bg-amber-100 px-1 font-mono">
-          cat /data/operator_token
+        <code className="rounded bg-warning-bg px-1 font-mono">
+          cat ./data/operator_token
         </code>{" "}
-        inside the backend container (or your data dir), paste it once —
-        it stays in this browser.
+        from your repo checkout — the file sits next to the database named
+        by <code className="rounded bg-warning-bg px-1 font-mono">$NEXUS_DB_PATH</code>{" "}
+        (default <code className="rounded bg-warning-bg px-1 font-mono">data/nexus.db</code>);
+        inside the backend container it is{" "}
+        <code className="rounded bg-warning-bg px-1 font-mono">
+          /data/operator_token
+        </code>
+        . Paste it once — it stays in this browser.
       </p>
       <form
         className="mt-2 flex flex-col gap-2 sm:flex-row"
@@ -68,7 +74,7 @@ export default function OperatorBanner() {
           onChange={(e) => setInput(e.target.value)}
           placeholder="Paste operator token…"
           autoComplete="off"
-          className="w-full rounded-lg border border-amber-300 bg-white px-3 py-1.5 font-mono text-sm text-ink placeholder:text-ink-3 focus:border-accent focus:outline-none focus:ring-2 focus:ring-accent/20 sm:max-w-sm"
+          className="w-full rounded-lg border border-warning-border bg-bg-raise px-3 py-1.5 font-mono text-sm text-ink placeholder:text-ink-3 focus:border-accent focus:outline-none focus:ring-2 focus:ring-accent/20 sm:max-w-sm"
         />
         <button
           type="submit"

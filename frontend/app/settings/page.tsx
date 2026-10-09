@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { API_BASE } from "../components/api";
+import { API_BASE, api } from "../components/api";
 import { LlmKeySettings } from "../components/llm-key-settings";
 import { getOperatorToken, setOperatorToken } from "../components/operator";
 import {
@@ -10,13 +10,16 @@ import {
   StatusNote,
   inputClass,
   primaryButtonClass,
+  useToast,
 } from "../components/ui";
 
 export default function SettingsPage() {
+  const notify = useToast();
   const [error, setError] = useState<string | null>(null);
   const [status, setStatus] = useState<string | null>(null);
   const [token, setToken] = useState("");
   const [backupBusy, setBackupBusy] = useState(false);
+  const [rotating, setRotating] = useState(false);
 
   useEffect(() => {
     setToken(getOperatorToken() ?? "");
@@ -29,7 +32,38 @@ export default function SettingsPage() {
         ? "Operator token saved on this device."
         : "Operator token cleared on this device."
     );
-  }, [token]);
+    notify(
+      token.trim() ? "Operator token saved" : "Operator token cleared",
+      "success"
+    );
+  }, [token, notify]);
+
+  const rotateToken = useCallback(async () => {
+    setRotating(true);
+    setError(null);
+    setStatus(null);
+    try {
+      const data = await api<{ token: string; rotated: boolean }>(
+        "/settings/operator-token/rotate",
+        { method: "POST" }
+      );
+      if (data.token) {
+        setOperatorToken(data.token);
+        setToken(data.token);
+        setStatus(
+          "Token rotated — the new token is saved on this device. " +
+            "Paste it into any other browser sessions."
+        );
+        notify("Token rotated", "success");
+      } else {
+        setError("Rotation did not return a new token.");
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not rotate token.");
+    } finally {
+      setRotating(false);
+    }
+  }, []);
 
   const exportBackup = useCallback(async () => {
     setBackupBusy(true);
@@ -54,6 +88,7 @@ export default function SettingsPage() {
       a.remove();
       URL.revokeObjectURL(url);
       setStatus("Backup downloaded — memories, pairings, policy, and identity.");
+      notify("Backup downloaded", "success");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Backup failed.");
     } finally {
@@ -116,7 +151,19 @@ export default function SettingsPage() {
               <button type="submit" className={primaryButtonClass}>
                 Save
               </button>
+              <button
+                type="button"
+                onClick={() => void rotateToken()}
+                disabled={rotating}
+                className="inline-flex shrink-0 items-center justify-center rounded-lg border border-line bg-bg px-4 py-1.5 text-sm font-medium text-ink-2 hover:bg-bg-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/50 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {rotating ? "Rotating…" : "Rotate token"}
+              </button>
             </form>
+            <p className="mt-2 text-xs text-ink-3">
+              Rotating replaces the token everywhere — re-paste it on any
+              other device or browser you use.
+            </p>
           </section>
 
           <LlmKeySettings />

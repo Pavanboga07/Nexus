@@ -14,6 +14,7 @@ import sqlite3
 
 from fastapi import APIRouter, BackgroundTasks, Depends
 from fastapi.responses import JSONResponse
+from app.api.errors import coded_error_response
 from pydantic import BaseModel
 
 from app import orchestration, tasks
@@ -58,20 +59,7 @@ class TaskIn(BaseModel):
     idempotency_key: str = ""
 
 
-def get_conn():
-    """Per-request SQLite connection (migrated, closed after)."""
-    from app.store import migrate, open_db
-
-    path = os.environ.get("NEXUS_DB_PATH", "data/nexus.db")
-    parent = os.path.dirname(path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    conn = open_db(path)
-    migrate(conn)
-    try:
-        yield conn
-    finally:
-        conn.close()
+from app.api.deps import get_conn
 
 
 def _db_path() -> str:
@@ -79,10 +67,7 @@ def _db_path() -> str:
 
 
 def _error(exc: TaskError) -> JSONResponse:
-    return JSONResponse(
-        status_code=exc.status or 400,
-        content={"detail": str(exc), "code": exc.code},
-    )
+    return coded_error_response(exc)
 
 
 def _detail(task_id: str, conn: sqlite3.Connection) -> dict:

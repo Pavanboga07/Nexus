@@ -17,6 +17,16 @@ MAX_PER_RECIPIENT_DEFAULT = 1000
 CLAIM_LIMIT_DEFAULT = 50
 
 
+class QueueFullError(ValueError):
+    """Recipient's pending queue is at capacity (F10: reject, don't silently evict)."""
+
+    def __init__(self, recipient: str, limit: int) -> None:
+        super().__init__(f"QUEUE_FULL: {recipient} already has {limit} pending messages")
+        self.code = "QUEUE_FULL"
+        self.recipient = recipient
+        self.limit = limit
+
+
 def _row_to_dict(row: RelayMessage) -> dict[str, Any]:
     return {
         "message_id": row.message_id,
@@ -42,6 +52,19 @@ async def enqueue(session: AsyncSession, *, envelope: dict[str, Any], max_per_re
         expires_at = _as_utc(parse_iso(envelope["expires_at"]))
     except KeyError as exc:
         raise ValueError(f"envelope is missing {exc}") from exc
+    # F10: backpressure instead of silent eviction. When the recipient is
+    # already at capacity the new message is REJECTED (QueueFullError);
+    # nothing already queued is moved to the DLQ behind the sender's back.
+    pending = (
+        await session.execute(
+            select(func.count()).where(
+                RelayMessage.recipient == recipient,
+                RelayMessage.status == "pending",
+            )
+        )
+    ).scalar_one()
+    if pending >= max_per_recipient:
+        raise QueueFullError(recipient, max_per_recipient)
     stmt = (
         pg_insert(RelayMessage)
         .values(message_id=message_id, sender=sender, recipient=recipient, envelope=dict(envelope), status="pending", expires_at=expires_at)
@@ -52,11 +75,6 @@ async def enqueue(session: AsyncSession, *, envelope: dict[str, Any], max_per_re
     await session.flush()
     if inserted is None:
         return "dedup_hit"
-    pending_ids = (await session.execute(select(RelayMessage.id).where(RelayMessage.recipient == recipient, RelayMessage.status == "pending").order_by(RelayMessage.created_at.asc(), RelayMessage.id.asc()))).scalars().all()
-    evict = pending_ids[: len(pending_ids) - max_per_recipient]
-    if evict:
-        await session.execute(update(RelayMessage).where(RelayMessage.id.in_(evict)).values(status="dlq"))
-        await session.flush()
     return "queued"
 
 
@@ -102,6 +120,7 @@ __all__ = [
     "CLAIM_LIMIT_DEFAULT",
     "MAX_ATTEMPTS_DEFAULT",
     "MAX_PER_RECIPIENT_DEFAULT",
+    "QueueFullError",
     "ack_delivered",
     "claim_for_recipient",
     "dlq_depth",
