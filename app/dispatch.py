@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any
 
 QUEUED_DELIVERY = {
     "mode": "queued",
@@ -54,10 +53,14 @@ def _sender_material(conn, secret: str | None, sender_ref: str | None):
         if row is None:  # pragma: no cover - resolve_signing_key guards
             raise RuntimeError("agent has no active key")
         return priv, agent_id, str(row["public_key"]), agent
-    from app.api.routes.ask import _local_key, _local_pubkey
+    from app.a2a.service import A2AError
+    from app.identity import service as identity_service
 
-    priv, agent_id = _local_key(conn)
-    return priv, agent_id, _local_pubkey(conn), None
+    try:
+        priv, agent_id = identity_service.local_key(conn)
+    except identity_service.IdentityCorruptionError as exc:
+        raise A2AError("NO_IDENTITY", str(exc), status=503) from exc
+    return priv, agent_id, identity_service.local_pubkey(conn), None
 
 
 async def deliver_envelope(
@@ -73,6 +76,13 @@ async def deliver_envelope(
     Opens a FRESH connection (never the request ``conn``) so HTTP
     requests never wait on the relay handshake. Ack -> ``relayed``;
     any exception -> ``delivery_failed`` (both readable via polling).
+
+    No ordering guarantee: the relay may push a newer envelope over a
+    live recipient socket while older unacked rows for that same
+    recipient still wait in its queue (queue/live boundary). Fixing
+    that needs a queue-flush before direct live delivery in
+    ``relay/main.py::handle_relay_envelope`` — relay-side, out of scope
+    for this app-side delivery function.
     """
     from app.a2a import relay_client
     from app.identity import crypto

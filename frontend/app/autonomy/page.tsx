@@ -4,14 +4,16 @@ import { useCallback, useEffect, useState } from "react";
 import { api } from "../components/api";
 import {
   EmptyState,
-  ErrorAlert,
+  ErrorRetry,
   LoadingSkeleton,
   PageHeader,
+  RelativeTime,
   StatusBadge,
   StatusNote,
   inputClass,
   primaryButtonClass,
   secondaryButtonClass,
+  useToast,
 } from "../components/ui";
 
 type Schedule = {
@@ -38,6 +40,7 @@ type Trigger = {
 };
 
 export default function AutonomyPage() {
+  const notify = useToast();
   const [schedules, setSchedules] = useState<Schedule[]>([]);
   const [triggers, setTriggers] = useState<Trigger[]>([]);
   const [loading, setLoading] = useState(true);
@@ -47,6 +50,9 @@ export default function AutonomyPage() {
   const [agent, setAgent] = useState("default");
   const [cron, setCron] = useState("0 8 * * *");
   const [capability, setCapability] = useState("");
+  const [trigEvent, setTrigEvent] = useState("");
+  const [trigAgent, setTrigAgent] = useState("default");
+  const [trigCapability, setTrigCapability] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
 
   const load = useCallback(async () => {
@@ -93,6 +99,7 @@ export default function AutonomyPage() {
       setName("");
       setCapability("");
       setStatus("Schedule created — it will run automatically.");
+      notify("Schedule created", "success");
       await load();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not create schedule.");
@@ -100,6 +107,72 @@ export default function AutonomyPage() {
       setBusy(null);
     }
   }, [name, agent, cron, capability, busy, load]);
+
+  const createTrigger = useCallback(async () => {
+    if (!trigEvent.trim() || !trigCapability.trim() || busy) return;
+    setBusy("create-trigger");
+    setError(null);
+    setStatus(null);
+    try {
+      await api("/autonomy/triggers", {
+        method: "POST",
+        body: JSON.stringify({
+          agent_id: trigAgent.trim() || "default",
+          event_type: trigEvent.trim(),
+          target_agent: trigAgent.trim() || "default",
+          target_capability: trigCapability.trim(),
+        }),
+      });
+      setTrigEvent("");
+      setTrigCapability("");
+      setStatus("Trigger created — it will fire on matching events.");
+      notify("Trigger created", "success");
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not create trigger.");
+    } finally {
+      setBusy(null);
+    }
+  }, [trigEvent, trigAgent, trigCapability, busy, load]);
+
+  const toggleTrigger = useCallback(
+    async (id: string, enabled: boolean) => {
+      setBusy(id);
+      setError(null);
+      try {
+        await api(
+          `/autonomy/triggers/${encodeURIComponent(id)}/${enabled ? "disable" : "enable"}`,
+          { method: "POST" }
+        );
+        await load();
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "Could not update trigger.");
+      } finally {
+        setBusy(null);
+      }
+    },
+    [load]
+  );
+
+  const removeTrigger = useCallback(
+    async (id: string) => {
+      setBusy(id);
+      setError(null);
+      try {
+        await api(`/autonomy/triggers/${encodeURIComponent(id)}`, {
+          method: "DELETE",
+        });
+        setStatus("Trigger deleted.");
+        notify("Trigger deleted", "warning");
+        await load();
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "Could not delete trigger.");
+      } finally {
+        setBusy(null);
+      }
+    },
+    [load]
+  );
 
   const toggle = useCallback(
     async (id: string, enabled: boolean) => {
@@ -129,6 +202,7 @@ export default function AutonomyPage() {
           method: "DELETE",
         });
         setStatus("Schedule deleted.");
+        notify("Schedule deleted", "warning");
         await load();
       } catch (err) {
         setError(err instanceof Error ? err.message : "Could not delete schedule.");
@@ -147,7 +221,7 @@ export default function AutonomyPage() {
       />
       {error && (
         <div className="mb-4">
-          <ErrorAlert message={error} />
+          <ErrorRetry message={error} onRetry={() => void load()} />
         </div>
       )}
       {status && (
@@ -261,11 +335,27 @@ export default function AutonomyPage() {
                       {s.agent_id} · {s.trigger}
                       {s.capability ? ` → ${s.capability}` : ""}
                     </p>
-                    <p className="mt-0.5 text-xs text-ink-3">
-                      {s.last_run_at
-                        ? `Last run ${s.last_run_at}`
-                        : "Never run yet"}
-                      {s.next_run_at ? ` · next ${s.next_run_at}` : ""}
+                    <p className="mt-0.5 flex flex-wrap items-center gap-x-1 text-xs text-ink-3">
+                      {s.last_run_at ? (
+                        <>
+                          Last run{" "}
+                          <RelativeTime
+                            iso={s.last_run_at}
+                            className="text-xs text-ink-3"
+                          />
+                        </>
+                      ) : (
+                        "Never run yet"
+                      )}
+                      {s.next_run_at && (
+                        <>
+                          {" "}· next{" "}
+                          <RelativeTime
+                            iso={s.next_run_at}
+                            className="text-xs text-ink-3"
+                          />
+                        </>
+                      )}
                     </p>
                   </div>
                   <StatusBadge status={s.enabled ? "enabled" : "disabled"} />
@@ -305,32 +395,110 @@ export default function AutonomyPage() {
           id="triggers-heading"
           className="mb-2 text-xs font-semibold uppercase tracking-widest text-ink-3"
         >
-          Triggers
+          New trigger
         </h2>
+        <form
+          className="mb-4 space-y-2 rounded-xl border border-line bg-bg-subtle p-4"
+          onSubmit={(e) => {
+            e.preventDefault();
+            void createTrigger();
+          }}
+        >
+          <div className="flex flex-col gap-2 sm:flex-row">
+            <div className="flex-1">
+              <label htmlFor="trig-event" className="block text-xs font-medium text-ink-2">
+                Event type
+              </label>
+              <input
+                id="trig-event"
+                value={trigEvent}
+                onChange={(e) => setTrigEvent(e.target.value)}
+                placeholder="e.g. task.completed"
+                className={inputClass}
+              />
+            </div>
+            <div className="flex-1">
+              <label htmlFor="trig-agent" className="block text-xs font-medium text-ink-2">
+                Agent
+              </label>
+              <input
+                id="trig-agent"
+                value={trigAgent}
+                onChange={(e) => setTrigAgent(e.target.value)}
+                placeholder="default"
+                className={inputClass}
+              />
+            </div>
+            <div className="flex-1">
+              <label htmlFor="trig-cap" className="block text-xs font-medium text-ink-2">
+                Capability
+              </label>
+              <input
+                id="trig-cap"
+                value={trigCapability}
+                onChange={(e) => setTrigCapability(e.target.value)}
+                placeholder="agent.capability@v1"
+                className={inputClass}
+              />
+            </div>
+          </div>
+          <button type="submit" disabled={busy === "create-trigger"} className={primaryButtonClass}>
+            {busy === "create-trigger" ? "Creating…" : "Create trigger"}
+          </button>
+        </form>
+        <h3 className="mb-2 text-xs font-semibold uppercase tracking-widest text-ink-3">
+          Triggers
+        </h3>
         {loading ? (
           <LoadingSkeleton label="Loading triggers" />
         ) : triggers.length === 0 ? (
           <EmptyState
             title="No triggers yet."
-            hint="Triggers run a workflow or capability when something happens."
+            hint="Create one above — pick an event, an agent, and what it should run."
           />
         ) : (
           <ul className="space-y-2">
             {triggers.map((t) => (
               <li
                 key={t.id}
-                className="flex items-center justify-between gap-3 rounded-xl border border-line bg-bg px-4 py-3"
+                className="rounded-xl border border-line bg-bg px-4 py-3"
               >
-                <div className="min-w-0">
-                  <p className="truncate text-sm font-medium text-ink">
-                    {t.event_type}
-                  </p>
-                  <p className="truncate text-xs text-ink-2">
-                    {t.agent_id}
-                    {t.target_capability ? ` → ${t.target_capability}` : ""}
-                  </p>
+                <div className="flex items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <p className="truncate text-sm font-medium text-ink">
+                      {t.event_type}
+                    </p>
+                    <p className="truncate text-xs text-ink-2">
+                      {t.agent_id}
+                      {t.target_capability ? ` → ${t.target_capability}` : ""}
+                    </p>
+                  </div>
+                  <StatusBadge status={t.enabled ? "enabled" : "disabled"} />
                 </div>
-                <StatusBadge status={t.enabled ? "enabled" : "disabled"} />
+                <div className="mt-2 flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    onClick={() => void toggleTrigger(t.id, t.enabled)}
+                    disabled={busy === t.id}
+                    aria-label={`${t.enabled ? "Disable" : "Enable"} trigger ${t.id}`}
+                    className={secondaryButtonClass}
+                  >
+                    {busy === t.id
+                      ? "Working…"
+                      : t.enabled
+                        ? "Disable"
+                        : "Enable"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void removeTrigger(t.id)}
+                    disabled={busy === t.id}
+                    aria-label={`Delete trigger ${t.id}`}
+                    className={secondaryButtonClass}
+                  >
+                    Delete
+                  </button>
+                </div>
               </li>
             ))}
           </ul>

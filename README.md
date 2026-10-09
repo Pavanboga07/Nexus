@@ -1,4 +1,9 @@
-nexus-v1 is a fresh rebuild of the Nexus two-laptop assistant network as a modular monolith per laptop (FastAPI + Next.js + SQLite), talking through one hardened relay with decentralized trust. The locked v1 demo definition: two laptops install from source checkouts, pair via invite codes, and complete one ask → approve-on-both-ends → cited answer loop over the network.
+nexus-v1 is a fresh rebuild of the Nexus two-laptop assistant network as a modular monolith per laptop (FastAPI + Next.js + SQLite), talking through one hardened relay with decentralized trust. The locked v1 demo definition: two laptops install from source checkouts, pair via invite codes, and complete one ask → recipient-side approval → cited answer loop over the network.
+
+Approval semantics (honest): an approval card parks on the *recipient's*
+end only — there is no sender-side approval in the ask loop (both-ends
+approval happens only in the *pairing* ceremony). A policy `ALLOW` rule
+skips approval entirely.
 
 ## Model provider (V5)
 

@@ -2,44 +2,279 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ── Nexus dark design tokens (single source of truth) ─────────────── */
 :root {
-  --bg: #ffffff;
-  --bg-subtle: #f9f9f9;
-  --bg-hover: #f0f0f0;
-  --ink: #1a1a1a;
-  --ink-2: #6b6b6b;
-  --ink-3: #9ca3af;
-  --line: #e5e5e5;
-  --accent: #10a37f;
-  --accent-d: #0d8a6a;
-  --danger: #dc2626;
-  --warning: #d97706;
-  --radius: 8px;
-  --radius-lg: 12px;
-  --radius-xl: 16px;
-  --space-1: 4px;
-  --space-2: 8px;
-  --space-3: 12px;
-  --space-4: 16px;
-  --space-5: 24px;
-  --space-6: 32px;
-  --space-7: 48px;
-  --space-8: 64px;
-  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-  --font-mono: ui-monospace, "SF Mono", "Cascadia Code", monospace;
-  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.05);
-  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.08);
+  color-scheme: dark;
+
+  /* bg layers: deep canvas → elevated surfaces */
+  --bg-deep: #07070c;
+  --bg: #0d0d14;
+  --bg-subtle: #12121a;
+  --bg-raise: #171722;
+  --bg-hover: #20202d;
+  --bg-overlay: #1b1b27;
+
+  /* ink scale */
+  --ink: #f4f4f8;
+  --ink-2: #b3b3c2;
+  --ink-3: #77778a;
+
+  /* borders */
+  --line: #24242f;
+  --line-soft: #1a1a24;
+
+  /* signature accent: electric violet */
+  --accent: #8b7cf6;
+  --accent-d: #7663f2;
+  --accent-soft: rgba(139, 124, 246, 0.13);
+  --accent-ink: #cdc3ff;
+
+  /* semantic */
+  --success: #34d399;
+  --success-bg: rgba(52, 211, 153, 0.12);
+  --success-border: rgba(52, 211, 153, 0.35);
+  --success-text: #7ce8bd;
+  --warning: #fbbf24;
+  --warning-bg: rgba(251, 191, 36, 0.1);
+  --warning-border: rgba(251, 191, 36, 0.35);
+  --warning-text: #fcd34d;
+  --danger: #f87171;
+  --danger-bg: rgba(248, 113, 113, 0.1);
+  --danger-border: rgba(248, 113, 113, 0.35);
+  --danger-text: #fca5a5;
+  --info: #60a5fa;
+  --info-bg: rgba(96, 165, 250, 0.1);
+  --info-border: rgba(96, 165, 250, 0.35);
+  --info-text: #93c5fd;
+
+  /* type */
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    "Helvetica Neue", sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono",
+    Menlo, Consolas, monospace;
+
+  /* type scale */
+  --text-xs: 0.75rem;
+  --text-sm: 0.875rem;
+  --text-base: 1rem;
+  --text-lg: 1.125rem;
+  --text-xl: 1.25rem;
+  --text-2xl: 1.5rem;
+
+  /* shape */
+  --radius: 10px;
+  --radius-lg: 14px;
+  --radius-xl: 20px;
+
+  /* elevation (dark-tuned: ambient + key light) */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.45);
+  --shadow-card: 0 2px 8px rgba(0, 0, 0, 0.35),
+    0 12px 32px rgba(0, 0, 0, 0.28);
+  --shadow-glow: 0 0 24px rgba(139, 124, 246, 0.32);
+  --shadow-pop: 0 16px 48px rgba(0, 0, 0, 0.55);
 }
 
 body {
   margin: 0;
   font-family: var(--font);
-  background-color: var(--bg);
+  background-color: var(--bg-deep);
   color: var(--ink);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+/* headings get a touch of tightness */
+h1,
+h2,
+h3 {
+  letter-spacing: -0.01em;
 }
 
 ::selection {
-  background-color: rgba(16, 163, 127, 0.15);
+  background-color: rgba(139, 124, 246, 0.38);
+  color: #ffffff;
+}
+
+/* ── scrollbars: thin, subtle ───────────────────────────────────────── */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--line) transparent;
+}
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--line);
+  border-radius: 8px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--ink-3);
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+
+/* ── keyframes ──────────────────────────────────────────────────────── */
+@keyframes nx-fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+@keyframes nx-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes nx-toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(12px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+@keyframes nx-drawer-in {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(0);
+  }
+}
+@keyframes nx-shimmer {
+  from {
+    background-position: 200% 0;
+  }
+  to {
+    background-position: -200% 0;
+  }
+}
+@keyframes nx-blink {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0;
+  }
+}
+@keyframes nx-typing {
+  0%,
+  60%,
+  100% {
+    transform: translateY(0);
+    opacity: 0.35;
+  }
+  30% {
+    transform: translateY(-4px);
+    opacity: 1;
+  }
+}
+@keyframes nx-pulse-dot {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(52, 211, 153, 0.45);
+  }
+  50% {
+    box-shadow: 0 0 0 5px rgba(52, 211, 153, 0);
+  }
+}
+
+/* ── motion utilities ───────────────────────────────────────────────── */
+.animate-message-in {
+  animation: nx-fade-up 0.35s cubic-bezier(0.21, 0.9, 0.35, 1) both;
+}
+.animate-toast-in {
+  animation: nx-toast-in 0.25s ease-out both;
+}
+.animate-drawer-in {
+  animation: nx-drawer-in 0.28s cubic-bezier(0.21, 0.9, 0.35, 1) both;
+}
+.animate-fade-in {
+  animation: nx-fade-in 0.2s ease-out both;
+}
+.live-dot {
+  animation: nx-pulse-dot 2s ease-in-out infinite;
+}
+
+/* shimmering skeleton block */
+.skeleton {
+  background: linear-gradient(
+    90deg,
+    var(--bg-hover) 25%,
+    var(--bg-raise) 50%,
+    var(--bg-hover) 75%
+  );
+  background-size: 200% 100%;
+  animation: nx-shimmer 1.5s linear infinite;
+}
+
+/* streaming caret rendered after in-flight text */
+.stream-caret::after {
+  content: "";
+  display: inline-block;
+  width: 2px;
+  height: 1.1em;
+  margin-left: 3px;
+  vertical-align: -0.2em;
+  border-radius: 1px;
+  background: var(--accent);
+  animation: nx-blink 1s step-end infinite;
+}
+
+/* typing indicator */
+.typing-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 9999px;
+  background: var(--ink-3);
+  animation: nx-typing 1.2s ease-in-out infinite;
+}
+.typing-dot:nth-child(2) {
+  animation-delay: 0.15s;
+}
+.typing-dot:nth-child(3) {
+  animation-delay: 0.3s;
+}
+
+/* shared surface primitive */
+@layer components {
+  .surface-card {
+    @apply rounded-xl border border-line bg-bg-raise shadow-card;
+  }
+}
+
+/* ── reduced motion: kill the theater, keep the meaning ─────────────── */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+  html {
+    scroll-behavior: auto;
+  }
+  .stream-caret::after {
+    animation: none;
+    opacity: 1;
+  }
 }

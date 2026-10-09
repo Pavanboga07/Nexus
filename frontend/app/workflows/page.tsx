@@ -4,7 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import { api } from "../components/api";
 import {
   EmptyState,
-  ErrorAlert,
+  ErrorRetry,
   LoadingSkeleton,
   PageHeader,
   StatusBadge,
@@ -12,6 +12,7 @@ import {
   inputClass,
   primaryButtonClass,
   secondaryButtonClass,
+  useToast,
 } from "../components/ui";
 
 type Step = {
@@ -32,6 +33,7 @@ type Workflow = {
 };
 
 export default function WorkflowsPage() {
+  const notify = useToast();
   const [workflows, setWorkflows] = useState<Workflow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -82,6 +84,7 @@ export default function WorkflowsPage() {
       setName("");
       setCapability("");
       setStatus(`Workflow “${flow.name}” started (${flow.status}).`);
+      notify("Workflow started", "success");
       await load();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not start workflow.");
@@ -99,6 +102,7 @@ export default function WorkflowsPage() {
           method: "POST",
         });
         setStatus(`Workflow ${action}d.`);
+        notify(`Workflow ${action}d`, "info");
         await load();
       } catch (err) {
         setError(err instanceof Error ? err.message : `Could not ${action}.`);
@@ -129,7 +133,7 @@ export default function WorkflowsPage() {
       />
       {error && (
         <div className="mb-4">
-          <ErrorAlert message={error} />
+          <ErrorRetry message={error} onRetry={() => void load()} />
         </div>
       )}
       {status && (
@@ -315,7 +319,7 @@ export default function WorkflowsPage() {
                   </p>
                 )}
                 {s.error && (
-                  <p className="mt-1 text-xs text-red-600">{s.error}</p>
+                  <p className="mt-1 text-xs text-danger-text">{s.error}</p>
                 )}
               </li>
             ))}

@@ -2,6 +2,15 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../components/api";
+import {
+  EmptyState,
+  ErrorAlert,
+  LoadingSkeleton,
+  StatusBadge,
+  StatusNote,
+  secondaryButtonClass,
+  useToast,
+} from "../components/ui";
 
 type Agent = {
   id: string;
@@ -25,6 +34,7 @@ type Capability = {
 };
 
 export default function AgentsPage() {
+  const notify = useToast();
   const [agents, setAgents] = useState<Agent[]>([]);
   const [caps, setCaps] = useState<Record<string, Capability[]>>({});
   const [loading, setLoading] = useState(true);
@@ -70,6 +80,7 @@ export default function AgentsPage() {
       setStatus(null);
       try {
         await api(path, { method: "POST", ...(init ?? {}) });
+        notify(`Agent ${label}d`, "info");
         await load();
       } catch (err) {
         setError(err instanceof Error ? err.message : `${label} failed.`);
@@ -91,6 +102,7 @@ export default function AgentsPage() {
       });
       setName("");
       setStatus("Agent created with its own keypair.");
+      notify("Agent created", "success");
       await load();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Create failed.");
@@ -111,22 +123,18 @@ export default function AgentsPage() {
         </p>
       </div>
 
-      {status && (
-        <p
-          role="status"
-          aria-live="polite"
-          className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-700"
-        >
-          {status}
-        </p>
-      )}
+      {status && <StatusNote message={status} />}
       {error && (
-        <p
-          role="alert"
-          className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700"
-        >
-          {error}
-        </p>
+        <div className="space-y-2">
+          <ErrorAlert message={error} />
+          <button
+            type="button"
+            onClick={() => void load()}
+            className={secondaryButtonClass}
+          >
+            Retry
+          </button>
+        </div>
       )}
 
       <section
@@ -176,11 +184,12 @@ export default function AgentsPage() {
           My agents
         </h2>
         {loading ? (
-          <p aria-live="polite" className="text-sm text-ink-3">
-            Loading…
-          </p>
+          <LoadingSkeleton label="Loading agents" />
         ) : agents.length === 0 ? (
-          <p className="text-sm text-ink-3">No agents yet.</p>
+          <EmptyState
+            title="No agents yet."
+            hint="Create your first agent above — it gets its own keys, memory, and capabilities."
+          />
         ) : (
           <ul className="divide-y divide-line">
             {agents.map((agent) => (
@@ -189,17 +198,7 @@ export default function AgentsPage() {
                   <span className="text-sm font-medium text-ink">
                     {agent.display_name || agent.id}
                   </span>
-                  <span
-                    className={`inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium uppercase tracking-wide ${
-                      agent.status === "active"
-                        ? "bg-emerald-50 text-emerald-700"
-                        : agent.status === "disabled"
-                          ? "bg-bg-hover text-ink-2"
-                          : "bg-red-50 text-red-600"
-                    }`}
-                  >
-                    {agent.status}
-                  </span>
+                  <StatusBadge status={agent.status} />
                   <span className="text-xs text-ink-3">
                     {caps[agent.id]?.length ?? 0} capabilities · key v
                     {agent.key_version} · autonomy{" "}
@@ -270,7 +269,10 @@ export default function AgentsPage() {
                           method: "POST",
                           body: JSON.stringify({ level }),
                         })
-                          .then(() => load())
+                          .then(() => {
+                            notify("Autonomy updated", "info");
+                            return load();
+                          })
                           .catch((err: unknown) =>
                             setError(
                               err instanceof Error

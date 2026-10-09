@@ -27,15 +27,18 @@ Limitation: this middleware only sees HTTP scopes (Starlette's
 
 from __future__ import annotations
 
+import logging
+import os
 import secrets
 import time
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Any
 
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
+
+logger = logging.getLogger(__name__)
 
 OPEN_PATHS = ("/health",)
 
@@ -53,7 +56,7 @@ def current_principal() -> "AuthenticatedPrincipal":
     if principal is None:
         return AuthenticatedPrincipal(
             owner_id="local", agent_id="default",
-            scopes=("operator",))
+            scopes=("operator",), is_operator_token=True)
     return principal
 
 #: Browsers cannot set Authorization headers on WebSocket handshakes, so
@@ -90,6 +93,11 @@ class AuthenticatedPrincipal:
     owner_id: str
     agent_id: str
     scopes: tuple[str, ...] = field(default_factory=lambda: ("operator",))
+    #: True only when the bearer matched the file/env operator token
+    #: (``verify_operator_token``) — never for DB-issued tokens, even
+    #: ones carrying a nominal ``operator`` scope. Gates the
+    #: token/owner management endpoints via :func:`require_operator`.
+    is_operator_token: bool = False
 
     def has_scope(self, scope: str) -> bool:
         return scope in self.scopes
@@ -105,23 +113,6 @@ def _bearer_token(request: Request) -> str:
 
 class OwnerDenied(RuntimeError):
     """Internal: resource belongs to another owner (surfaced as 404)."""
-
-
-def require_owner_agent(conn, agent_ref: str) -> dict:
-    """Resolve an agent the caller owns; unknown-or-foreign → 404.
-
-    Never confirms cross-owner existence: both cases look identical.
-    """
-    from app import agents
-
-    principal = current_principal()
-    try:
-        agent = agents.resolve_agent(conn, agent_ref)
-    except agents.AgentError:
-        raise OwnerDenied()
-    if agent["owner_id"] != principal.owner_id:
-        raise OwnerDenied()
-    return agent
 
 
 def principal_for_request(request: Request) -> AuthenticatedPrincipal | None:
@@ -144,6 +135,10 @@ class _Unauthorized(RuntimeError):
     """Internal: route asked for a principal the middleware never set."""
 
 
+class _Forbidden(RuntimeError):
+    """Internal: principal lacks operator privilege (surfaced as 403)."""
+
+
 def _unauthorized_response() -> JSONResponse:
     return JSONResponse(
         status_code=401,
@@ -153,6 +148,54 @@ def _unauthorized_response() -> JSONResponse:
         },
         headers={"WWW-Authenticate": "Bearer"},
     )
+
+
+def _forbidden_response() -> JSONResponse:
+    return JSONResponse(
+        status_code=403,
+        content={
+            "detail": "Operator privilege required.",
+            "code": "FORBIDDEN",
+        },
+    )
+
+
+def require_operator(request: Request) -> AuthenticatedPrincipal:
+    """Route dependency: the file/env operator principal only.
+
+    DB-issued tokens — even ones carrying a nominal ``operator`` scope —
+    cannot mint/revoke tokens, manage owners, or rotate the operator
+    token. Only the operator token (file or ``NEXUS_OPERATOR_TOKEN``)
+    is trusted for that. Use as ``Depends(require_operator)``.
+    """
+    principal = require_principal(request)
+    if not principal.is_operator_token:
+        raise _Forbidden()
+    return principal
+
+
+def client_ip(request: Request) -> str:
+    """Best-effort client IP for rate-limit keys.
+
+    ``X-Forwarded-For`` is only trusted behind an explicit
+    ``TRUST_PROXY`` env var (``1``/``true``/``yes``/``on``) — otherwise
+    the header is trivially spoofable and an attacker can rotate the
+    rate-limit bucket at will. Default is the direct peer address.
+    """
+    if os.environ.get("TRUST_PROXY", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    ):
+        forwarded = (
+            request.headers.get("x-forwarded-for", "") or ""
+        ).split(",")[0].strip()
+        if forwarded:
+            return forwarded
+    try:
+        if request.client is not None:
+            return request.client.host
+    except Exception:  # noqa: BLE001 - best-effort only
+        logger.debug("client_ip: request.client unreadable", exc_info=True)
+    return "unknown"
 
 
 class OperatorAuthMiddleware(BaseHTTPMiddleware):
@@ -173,6 +216,8 @@ class OperatorAuthMiddleware(BaseHTTPMiddleware):
                 return await call_next(request)
             except _Unauthorized:
                 return _unauthorized_response()
+            except _Forbidden:
+                return _forbidden_response()
         finally:
             _current_principal.reset(reset)
 
@@ -188,23 +233,23 @@ def _resolve_principal(token: str) -> AuthenticatedPrincipal | None:
 
     if verify_operator_token(token):
         return AuthenticatedPrincipal(
-            owner_id="local", agent_id="default", scopes=("operator",))
+            owner_id="local", agent_id="default", scopes=("operator",),
+            is_operator_token=True)
     try:
         from app import owners
-        from app.store import open_db
+        from app.store import migrate, open_db
     except ImportError:
         return None
+    # sqlite3 errors propagate (→ 500): a corrupt DB must never
+    # silently de-authenticate every request. migrate() runs first so a
+    # merely-unmigrated DB resolves to 401 (unknown token), not 500.
+    path = os.environ.get("NEXUS_DB_PATH", "data/nexus.db")
+    conn = open_db(path)
     try:
-        import os
-
-        path = os.environ.get("NEXUS_DB_PATH", "data/nexus.db")
-        conn = open_db(path)
-        try:
-            resolved = owners.resolve_token(conn, token)
-        finally:
-            conn.close()
-    except Exception:
-        return None
+        migrate(conn)
+        resolved = owners.resolve_token(conn, token)
+    finally:
+        conn.close()
     if resolved is None:
         return None
     return AuthenticatedPrincipal(
@@ -222,11 +267,12 @@ __all__ = [
     "AuthenticatedPrincipal",
     "OperatorAuthMiddleware",
     "OwnerDenied",
+    "client_ip",
     "current_principal",
     "issue_live_ticket",
     "owner_404",
     "principal_for_request",
     "redeem_live_ticket",
-    "require_owner_agent",
+    "require_operator",
     "require_principal",
 ]

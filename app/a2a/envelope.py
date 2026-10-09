@@ -9,6 +9,7 @@ against a pinned peer key. No canonical logic is duplicated here.
 
 from __future__ import annotations
 
+import os
 import uuid
 from typing import Any
 
@@ -17,6 +18,24 @@ from relay import envelope as _relay
 PROTOCOL = _relay.PROTOCOL
 VERSION = _relay.VERSION
 MESSAGE_TYPES = _relay.MESSAGE_TYPES
+
+#: Fallback envelope TTL (seconds) when neither an explicit expiry nor
+#: ``ttl_seconds`` is given. The old hardcoded 300s default is now just
+#: the default of ``NEXUS_ENVELOPE_TTL_SECONDS`` (audit §4 F6).
+DEFAULT_TTL_SECONDS = 300
+
+
+def _default_ttl_seconds() -> int:
+    """Read ``NEXUS_ENVELOPE_TTL_SECONDS``; missing/garbage/negative
+    values fall back to 300."""
+    try:
+        value = int(
+            os.environ.get("NEXUS_ENVELOPE_TTL_SECONDS", "")
+            or DEFAULT_TTL_SECONDS
+        )
+    except (TypeError, ValueError):
+        return DEFAULT_TTL_SECONDS
+    return value if value > 0 else DEFAULT_TTL_SECONDS
 
 
 def _new_id(prefix: str, explicit: str | None = None) -> str:
@@ -35,12 +54,19 @@ def new_envelope(
     expires_at: str | None = None,
     message_id: str | None = None,
     correlation_id: str | None = None,
+    ttl_seconds: int | None = None,
 ) -> dict[str, Any]:
     """Build an unsigned envelope dict (validated, unsigned).
 
-    Raises the relay's validation errors on strict-timestamp or
+    Expiry precedence: an explicit ``expires_at`` wins; otherwise
+    ``ttl_seconds``; otherwise ``NEXUS_ENVELOPE_TTL_SECONDS`` (default
+    300). Raises the relay's validation errors on strict-timestamp or
     float-payload violations (same frozen rules).
     """
+    if ttl_seconds is None:
+        ttl_seconds = _default_ttl_seconds()
+    if ttl_seconds <= 0:
+        raise ValueError("ttl_seconds must be positive.")
     env = _relay.Envelope.model_validate(
         {
             "protocol": PROTOCOL,
@@ -50,7 +76,7 @@ def new_envelope(
             "sender": sender,
             "recipient": recipient,
             "timestamp": timestamp or _relay.utc_now_iso(),
-            "expires_at": expires_at or _relay.utc_iso_in(300),
+            "expires_at": expires_at or _relay.utc_iso_in(ttl_seconds),
             "message_type": message_type,
             "payload": payload,
         }
@@ -69,12 +95,13 @@ def verify(envelope: dict[str, Any], public_key_b64: str) -> bool:
 
 
 def unsigned_dict(envelope: dict[str, Any]) -> dict[str, Any]:
-    """Envelope minus its signature (the signed bytes' source)."""
-    return {
-        key: value
-        for key, value in envelope.items()
-        if key != "signature"
-    }
+    """Envelope minus its signature (the signed bytes' source).
+
+    Delegates to the canonical ``relay.envelope`` implementation so
+    the None-handling (absent, never null) matches exactly what
+    ``sign``/``verify`` cover. Do not reimplement here.
+    """
+    return _relay.Envelope.model_validate(envelope).unsigned_dict()
 
 
 def signed_error(

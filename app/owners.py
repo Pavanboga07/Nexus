@@ -22,18 +22,15 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+from app.errors import NexusError
+
 _OWNER_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$")
 DEFAULT_OWNER = "local"
 OPERATOR_SCOPE = "operator"
 
 
-class OwnerError(RuntimeError):
+class OwnerError(NexusError):
     """Owner/token failure with machine ``code`` + HTTP ``status``."""
-
-    def __init__(self, code: str, message: str, status: int | None = None):
-        super().__init__(f"{code}: {message}")
-        self.code = code
-        self.status = status
 
 
 def _now() -> str:

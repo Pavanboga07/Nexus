@@ -11,7 +11,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.identity import crypto
+import nexus_crypto as crypto
 from relay.envelope import TIMESTAMP_PATTERN, canonical_json_bytes, parse_iso
 from relay.models import DirectoryEntry, RateHit
 
@@ -107,7 +107,7 @@ def sign_card(private_key, card: dict[str, Any]) -> dict[str, Any]:
     return {**unsigned, "signature": base64.b64encode(raw_sig).decode("ascii")}
 
 
-async def check_rate_limit(session: AsyncSession, ip: str, *, limit: int, window_seconds: float = RATE_WINDOW_SECONDS) -> None:
+async def enforce_rate_limit(session: AsyncSession, ip: str, *, limit: int, window_seconds: float = RATE_WINDOW_SECONDS) -> None:
     cutoff = datetime.now(timezone.utc) - timedelta(seconds=window_seconds)
     await session.execute(delete(RateHit).where(RateHit.created_at < cutoff))
     count = (await session.execute(select(func.count()).where(RateHit.ip == ip))).scalar_one()

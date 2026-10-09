@@ -384,9 +384,17 @@ def test_missing_key_is_clear(monkeypatch, tmp_path):
         assert "NEXUS_LLM_API_KEY" in str(exc)
 
 
-def test_sse_endpoint_streams_tool_cards_and_done(monkeypatch):
+def test_sse_endpoint_streams_tool_cards_and_done(monkeypatch, tmp_path):
+    import os
+
     import app.api.routes.chat as chat_route
     from app.main import app
+
+    # Test isolation: the endpoint opens the default ``data/nexus.db``.
+    # Create it under an isolated cwd so this test never depends on a
+    # data/ directory left behind by an earlier test.
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("data", exist_ok=True)
 
     async def source(payload):
         yield {"content": "hello "}

@@ -27,11 +27,19 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import re
 import secrets
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
+
+from app.errors import NexusError
+from app.events import emit_best_effort
+from app.time import iso as _iso
+from app.time import utcnow as _utcnow
+
+logger = logging.getLogger(__name__)
 
 CODE_WORDS = 6
 INVITE_TTL_SECONDS = 900  # 15 minutes
@@ -61,21 +69,13 @@ WORDLIST: list[str] = [p + s for p in _PREFIXES for s in _SUFFIXES]
 _WORDSET = frozenset(WORDLIST)
 
 
-class PairingError(ValueError):
-    """Pairing failure with machine ``code`` and optional HTTP ``status``."""
+class PairingError(NexusError, ValueError):
+    """Pairing failure with machine ``code`` and optional HTTP ``status``.
 
-    def __init__(self, code: str, message: str, status: int | None = None) -> None:
-        super().__init__(f"{code}: {message}")
-        self.code = code
-        self.status = status
-
-
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def _iso(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).isoformat()
+    Stays a ``ValueError`` (multiple inheritance) so existing
+    ``except ValueError`` call sites — e.g. ``relay/invites.py`` — keep
+    catching it.
+    """
 
 
 def _parse(value: str) -> datetime | None:
@@ -424,16 +424,8 @@ def set_peer_trust(conn: sqlite3.Connection, agent_id: str,
             raise PairingError(
                 "NOT_PAIRED", f"unknown peer {agent_id!r}.", status=404
             )
-    try:
-        from app import autonomy as autonomy_mod
-
-        autonomy_mod.emit_event(
-            conn, f"peer.{state.lower()}",
-            {"agent_id": agent_id},
-            agent_id="",
-        )
-    except Exception:
-        pass
+    emit_best_effort(conn, f"peer.{state.lower()}",
+                       {"agent_id": agent_id}, agent_id="")
     peer = get_peer(conn, agent_id)
     assert peer is not None
     return peer
@@ -450,7 +442,8 @@ def touch_peer_seen(conn: sqlite3.Connection, agent_id: str,
                 (now, agent_id),
             )
     except sqlite3.Error:
-        pass
+        logger.debug("best-effort last_seen bump for %r dropped",
+                     agent_id, exc_info=True)
 
 
 def unpair(conn: sqlite3.Connection, agent_id: str) -> bool:
@@ -471,7 +464,9 @@ def _raise_for_relay_response(status: int, body: Any) -> PairingError:
     return PairingError(code, detail, status=status)
 
 
-def http_publish_transport(base_url: str):
+def http_publish_transport(
+    base_url: str,
+) -> Callable[[str, dict[str, Any]], dict[str, Any]]:
     """Publish transport over HTTP (used by the API route)."""
     import httpx
 
@@ -492,7 +487,9 @@ def http_publish_transport(base_url: str):
     return publish
 
 
-def http_claim_transport(base_url: str):
+def http_claim_transport(
+    base_url: str,
+) -> Callable[[str], dict[str, Any]]:
     """Claim transport over HTTP (used by the API route)."""
     import httpx
 

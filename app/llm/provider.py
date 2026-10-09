@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
@@ -36,7 +35,11 @@ from typing import Any
 
 import httpx
 
-from app.tools.search_tools import PURPOSE
+#: Purpose tag stamped on ``web_search`` tool events. Matches
+#: ``WebSearchTool``'s ``PURPOSE`` in ``app.tools.search_tools`` (kept as
+#: the literal here so the LLM layer does not depend on the tools
+#: package for a constant — finding F10).
+WEB_SEARCH_PURPOSE = "web-research"
 
 SYSTEM_PROMPT = """You are Nexus, a personal AI assistant.
 
@@ -524,7 +527,7 @@ class OpenAICompatibleProvider:
                     "type": "tool_pending",
                     "tool": name,
                     "args": args,
-                    "purpose": PURPOSE,
+                    "purpose": WEB_SEARCH_PURPOSE,
                 }
                 result = await executor(name, args)
                 text, stop = _normalize_executor_result(result)

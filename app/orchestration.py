@@ -19,11 +19,15 @@ their children close.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from typing import Any
 
-from app import tasks
+from app import agents, capabilities, delegations, discovery, tasks
+from app.execution import ExecutionError, execute_capability
 from app.tasks import TaskError
+
+logger = logging.getLogger(__name__)
 
 
 def _is_group(task: dict[str, Any]) -> bool:
@@ -31,7 +35,6 @@ def _is_group(task: dict[str, Any]) -> bool:
 
 
 def _local_agent(conn, ref: str) -> dict | None:
-    from app import agents
 
     try:
         return agents.resolve_agent(conn, ref)
@@ -55,7 +58,6 @@ def resolve_task(conn: sqlite3.Connection, task_id: str) -> dict[str, Any]:
     explicit match or AMBIGUOUS with candidates — never a silent pick).
     Never falls back to the default agent.
     """
-    from app import agents, capabilities, discovery
 
     task = tasks.get_task(conn, task_id)
     if task["status"] != "PENDING":
@@ -129,13 +131,13 @@ def resolve_task(conn: sqlite3.Connection, task_id: str) -> dict[str, Any]:
 
 
 def _capability_owned_by(conn, target_crypto: str, cap_id: str) -> bool:
-    from app import capabilities, discovery
 
     try:
         cap = capabilities.get_capability(conn, cap_id)
         return cap["agent_id"] == target_crypto and cap["status"] == "active"
     except capabilities.CapabilityError:
-        pass
+        logger.debug("capability %r not in registry; checking peer card",
+                     cap_id, exc_info=True)
     row = conn.execute(
         "SELECT card_json FROM paired_peers WHERE agent_id = ?",
         (target_crypto,),
@@ -157,7 +159,6 @@ def _requesting_agent(conn, task: dict) -> tuple[str, str]:
     kind is "owner" (operator authority, needs no delegation) or
     "agent" (must hold a grant unless acting for itself).
     """
-    from app import agents
 
     ref = (task["requesting_agent_id"] or "").strip()
     if ref in ("", "owner"):
@@ -180,7 +181,9 @@ def authorize_task(conn: sqlite3.Connection,
     (DENY fails, ASK parks an approval card), then grant-demanded
     approval. Group tasks authorize trivially.
     """
-    from app import delegations
+    # WHY lazy: app.a2a.service is the A2A facade with its own lazy
+    # cycle edges (tasks/pairing); hoisting it here is out of scope
+    # for this pass — its module owns those edges.
     from app.a2a import service
 
     task = tasks.get_task(conn, task_id)
@@ -292,9 +295,10 @@ async def dispatch_task(conn: sqlite3.Connection, task_id: str,
     background it via ``app.dispatch``; tests drive it directly).
     Returns (task, envelope_or_None).
     """
-    from app import agents
+    # WHY lazy: app.a2a.service is the A2A facade with its own lazy
+    # cycle edges (tasks/pairing); hoisting it here is out of scope
+    # for this pass — its module owns those edges.
     from app.a2a import service
-    from app.execution import ExecutionError, execute_capability
 
     task = tasks.get_task(conn, task_id)
     if task["status"] != "AUTHORIZED":
@@ -419,7 +423,6 @@ def reconcile_agent_tasks(conn: sqlite3.Connection,
     another agent without explicit authorization could leak sensitive
     tasks. Returns the failed task ids per terminal cause.
     """
-    from app import agents
 
     agent = agents.resolve_agent(conn, agent_ref)
     if agent["status"] == "active":

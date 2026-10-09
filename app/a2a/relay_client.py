@@ -80,10 +80,16 @@ def _close_code(exc: BaseException) -> str | None:
 
 
 async def _expect_close_code(ws: Any) -> str | None:
-    """Wait for the socket teardown; return its close code, if visible."""
+    """Wait for the socket teardown; return its close code, if visible.
+
+    Cancellation is never swallowed: ``CancelledError`` propagates so
+    shutdown stays prompt and misreports nothing.
+    """
     try:
         await ws.receive_json()
-    except BaseException as exc:  # noqa: BLE001 - any close shape counts
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
         return _close_code(exc)
     return None
 
@@ -203,6 +209,37 @@ async def send_envelope(
 async def ack_delivery(ws: Any, relay_id: str) -> None:
     """Settle one incoming ``delivery`` on the same socket."""
     await ws.send_json({"type": "delivery_ack", "relay_id": relay_id})
+
+
+# --- heartbeats ---------------------------------------------------------------
+
+#: How often the client proactively pings the relay. The server answers
+#: ``heartbeat_ack`` and refreshes the agent's presence row (see the
+#: ``heartbeat`` branch in ``relay/main.py``).
+HEARTBEAT_INTERVAL = 30.0
+
+
+async def heartbeat_loop(
+    ws: Any, *, interval: float = HEARTBEAT_INTERVAL
+) -> None:
+    """Send a protocol heartbeat every ``interval`` seconds.
+
+    The lifespan listener runs this as a background task alongside the
+    open relay connection: each ``{"type": "heartbeat"}`` frame makes
+    the relay answer ``heartbeat_ack`` and refresh the agent's presence
+    row, so presence stops going stale on long-lived connections. Any
+    send failure ends the loop — the connection is dead and the
+    owner's reconnect logic takes over. Cancellation always
+    propagates; it is never swallowed here.
+    """
+    try:
+        while True:
+            await asyncio.sleep(interval)
+            await ws.send_json({"type": "heartbeat"})
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 - dead socket ends heartbeats
+        return
 
 
 # --- stdlib connector (production; no new dependencies) -----------------------
@@ -438,6 +475,7 @@ async def deliver_one(
 __all__ = [
     "ACK_TIMEOUT",
     "CONNECT_TIMEOUT",
+    "HEARTBEAT_INTERVAL",
     "WS_CLOSE_UNAUTHORIZED",
     "ConnectionClosed",
     "RelayAuthError",
@@ -447,6 +485,7 @@ __all__ = [
     "authenticate",
     "connect",
     "deliver_one",
+    "heartbeat_loop",
     "open_connection",
     "send_envelope",
 ]

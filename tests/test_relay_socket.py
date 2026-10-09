@@ -199,12 +199,18 @@ def test_kill_mid_flight_redelivers_on_reconnect(relay_engine):
 
 
 def test_offline_message_queued_then_received(relay_engine):
+    # F3: the recipient must be routable (connected, directory card, prior
+    # session, or open invite) or dispatch fails fast with NOT_SUPPORTED.
+    # b connects once first so its presence row makes it routable while
+    # offline; a's message then queues and is flushed on b's reconnect.
     a_priv, a_pub, a_id, b_priv, b_pub, b_id = authed_pair()
     env = make_envelope(
         sender=a_id, recipient=b_id, message_id="msg_offline_ws001",
         expires_at="2027-09-20T12:00:00Z",
     )
     with TestClient(make_app()) as client:
+        with client.websocket_connect("/ws") as ws_b:
+            assert handshake(ws_b, b_priv, b_pub, b_id)["success"] is True
         with client.websocket_connect("/ws") as ws_a:
             assert handshake(ws_a, a_priv, a_pub, a_id)["success"] is True
             ws_a.send_json(
@@ -225,6 +231,31 @@ def test_offline_message_queued_then_received(relay_engine):
                 {"type": "delivery_ack",
                  "relay_id": delivery["relay_id"]}
             )
+
+
+def test_unknown_recipient_fails_fast_not_supported(relay_engine):
+    # F3: an address nothing ever authenticated as (e.g. a sub-agent id)
+    # must fail dispatch fast, not queue into a black hole.
+    a_priv, a_pub, a_id = new_agent()
+    _, _, ghost_id = new_agent()
+    env = make_envelope(
+        sender=a_id, recipient=ghost_id, message_id="msg_ghost001",
+        expires_at="2027-09-20T12:00:00Z",
+    )
+    with TestClient(make_app()) as client:
+        with client.websocket_connect("/ws") as ws_a:
+            assert handshake(ws_a, a_priv, a_pub, a_id)["success"] is True
+            ws_a.send_json(
+                {
+                    "type": "relay_envelope",
+                    "relay_id": "relay_ghost001",
+                    "recipient": ghost_id,
+                    "envelope": env,
+                }
+            )
+            err = ws_a.receive_json()
+            assert err["type"] == "error"
+            assert err["code"] == "NOT_SUPPORTED"
 
 
 def test_heartbeat_updates_presence_and_observability(relay_engine):

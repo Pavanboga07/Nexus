@@ -6,14 +6,34 @@ import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 
 import { closeUnclosedFences, splitSegments } from "./markdown";
-import { API_BASE, api, isExpiredError, wsBase } from "../components/api";
+import { api, isExpiredError, wsBase } from "../components/api";
 import { LlmStatusLine } from "../components/llm-key-settings";
-import { authHeaders } from "../components/operator";
+import {
+  CodeBlock,
+  CopyButton,
+  RelativeTime,
+  TypingIndicator,
+  secondaryButtonClass,
+} from "../components/ui";
+import { AskPanel } from "./ask-panel";
+import { CitationList } from "./citations";
+import { StreamPanel } from "./stream-panel";
+import { ThreadTurn, useChatStream } from "./use-chat-stream";
 
 const SESSION_KEY = "nexus-session-id";
 
 function mintSessionId(): string {
   return `chat-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/** Stable React key for a history turn: content hash + index fallback. */
+function turnKey(turn: ThreadTurn, index: number): string {
+  const s = `${turn.role}|${turn.created_at}|${turn.text}|${turn.citations.join(",")}`;
+  let h = 0;
+  for (let i = 0; i < s.length; i++) {
+    h = (Math.imul(31, h) + s.charCodeAt(i)) | 0;
+  }
+  return `history-${h.toString(36)}-${index}`;
 }
 
 function loadOrCreateSessionId(): string {
@@ -190,7 +210,7 @@ function CommCard({
     (m): m is ChatMessage => m !== null && m.status === "delivery_failed"
   );
   return (
-    <li className="rounded-xl border border-line bg-bg-subtle">
+    <li className="animate-message-in rounded-xl border border-line bg-bg-raise shadow-card">
       <div className="px-4 py-3">
         <p className="text-xs font-semibold uppercase tracking-widest text-ink-3">
           Agent communication
@@ -201,16 +221,16 @@ function CommCard({
         </p>
         <ul className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-ink-2">
           <li>
-            <span aria-hidden="true" className="text-emerald-600">✓</span>{" "}
+            <span aria-hidden="true" className="text-success-text">✓</span>{" "}
             {pending ? "Waiting for approval" : "Approved"}
           </li>
           <li>
-            <span aria-hidden="true" className="text-emerald-600">✓</span>{" "}
+            <span aria-hidden="true" className="text-success-text">✓</span>{" "}
             {delivery}
           </li>
           {answer && (
             <li>
-              <span aria-hidden="true" className="text-emerald-600">✓</span>{" "}
+              <span aria-hidden="true" className="text-success-text">✓</span>{" "}
               Answer received
             </li>
           )}
@@ -254,7 +274,7 @@ function CommCard({
                       type="button"
                       onClick={() => onRetry(m.message_id)}
                       disabled={retryingId === m.message_id}
-                      className="inline-flex items-center justify-center rounded-lg border border-amber-200 bg-amber-50 px-3 py-1.5 text-xs font-medium text-amber-800 hover:bg-amber-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/50 disabled:cursor-not-allowed disabled:opacity-50"
+                      className="inline-flex items-center justify-center rounded-lg border border-warning-border bg-warning-bg px-3 py-1.5 text-xs font-medium text-warning-text hover:bg-warning-bg focus:outline-none focus-visible:ring-2 focus-visible:ring-warning/50 disabled:cursor-not-allowed disabled:opacity-50"
                     >
                       {retryingId === m.message_id ? "Retrying…" : "Retry delivery"}
                     </button>
@@ -270,7 +290,7 @@ function CommCard({
             type="button"
             onClick={() => onRetry(failedMsg.message_id)}
             disabled={retryingId === failedMsg.message_id}
-            className="inline-flex items-center justify-center rounded-lg border border-amber-200 bg-amber-50 px-3 py-1.5 text-xs font-medium text-amber-800 hover:bg-amber-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/50 disabled:cursor-not-allowed disabled:opacity-50"
+            className="inline-flex items-center justify-center rounded-lg border border-warning-border bg-warning-bg px-3 py-1.5 text-xs font-medium text-warning-text hover:bg-warning-bg focus:outline-none focus-visible:ring-2 focus-visible:ring-warning/50 disabled:cursor-not-allowed disabled:opacity-50"
           >
             {retryingId === failedMsg.message_id
               ? "Retrying…"
@@ -291,74 +311,13 @@ function ErrorState({ message }: { message: string }) {
   return (
     <p
       role="alert"
-      className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700"
+      className="rounded-lg border border-danger-border bg-danger-bg px-3 py-2 text-sm text-danger-text"
     >
       {message}
     </p>
   );
 }
 
-function CopyButton({ text, label }: { text: string; label: string }) {
-  const [copied, setCopied] = useState(false);
-  return (
-    <button
-      type="button"
-      aria-label={copied ? "Copied" : label}
-      title={copied ? "Copied" : label}
-      onClick={() => {
-        const done = () => {
-          setCopied(true);
-          window.setTimeout(() => setCopied(false), 2000);
-        };
-        try {
-          const result = navigator.clipboard?.writeText(text);
-          if (result && typeof result.then === "function") {
-            result.then(done, () => setCopied(false));
-          } else {
-            done();
-          }
-        } catch {
-          setCopied(false);
-        }
-      }}
-      className="inline-flex items-center gap-1 rounded-md px-1.5 py-1 text-xs text-ink-3 hover:bg-bg-hover hover:text-ink-2 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent"
-    >
-      <svg
-        aria-hidden="true"
-        width="13"
-        height="13"
-        viewBox="0 0 16 16"
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="1.5"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      >
-        <rect x="5" y="5" width="9" height="9" rx="2" />
-        <path d="M11 5V4a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2v5a2 2 0 0 0 2 2h1" />
-      </svg>
-      {copied ? "Copied" : "Copy"}
-    </button>
-  );
-}
-
-function formatTime(createdAt: string): string | null {
-  if (!createdAt) return null;
-  const ts = new Date(createdAt).getTime();
-  if (Number.isNaN(ts)) return null;
-  return new Date(ts).toLocaleString(undefined, {
-    month: "short",
-    day: "numeric",
-    hour: "numeric",
-    minute: "2-digit",
-  });
-}
-
-type StreamToolCard = {
-  tool: string;
-  status: "pending" | "completed";
-  result?: string;
-};
 
 function renderInline(text: string, keyPrefix: string): ReactNode[] {
   const nodes: ReactNode[] = [];
@@ -419,12 +378,7 @@ function SafeMarkdown({ text }: { text: string }) {
     <>
       {segments.map((seg, i) =>
         seg.kind === "code" ? (
-          <pre
-            key={i}
-            className="overflow-x-auto rounded-lg border border-line bg-bg-subtle p-3 font-mono text-xs leading-relaxed text-ink"
-          >
-            <code>{seg.text}</code>
-          </pre>
+          <CodeBlock key={i} lang={seg.lang} text={seg.text} />
         ) : (
           <span key={i} className="block space-y-2">
             {seg.text.split(/\n{2,}/).map((para, j) => (
@@ -449,13 +403,6 @@ function messageBody(msg: ChatMessage): string {
   return "";
 }
 
-type ThreadTurn = {
-  role: string;
-  text: string;
-  citations: string[];
-  created_at: string;
-};
-
 const SUGGESTIONS = [
   "Research the latest news on a topic I follow",
   "Explain a complex idea in simple terms",
@@ -465,22 +412,35 @@ const SUGGESTIONS = [
 
 function EmptyThread({ onSuggest }: { onSuggest: (text: string) => void }) {
   return (
-    <div className="flex flex-1 flex-col items-center justify-center gap-4 p-8 text-center">
-      <p className="text-lg font-medium text-ink">What can I help with?</p>
-      <div className="flex max-w-md flex-wrap items-center justify-center gap-2">
+    <div className="flex flex-1 flex-col items-center justify-center gap-5 p-8 text-center">
+      <span
+        aria-hidden="true"
+        className="flex h-16 w-16 items-center justify-center rounded-3xl bg-gradient-to-br from-accent to-accent-d text-2xl font-bold text-white shadow-glow"
+      >
+        N
+      </span>
+      <div className="space-y-1">
+        <p className="text-xl font-semibold tracking-tight text-ink">
+          What can I help with?
+        </p>
+        <p className="text-sm text-ink-3">
+          Ask live for web answers with sources — or ask a paired peer.
+        </p>
+      </div>
+      <div className="flex max-w-lg flex-wrap items-center justify-center gap-2">
         {SUGGESTIONS.map((text) => (
           <button
             key={text}
             type="button"
             onClick={() => onSuggest(text)}
-            className="inline-flex items-center justify-center rounded-full border border-line bg-bg px-4 py-2 text-sm text-ink-2 hover:bg-bg-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+            className="inline-flex items-center justify-center rounded-full border border-line bg-bg-raise px-4 py-2 text-sm text-ink-2 shadow-sm transition-all hover:-translate-y-px hover:border-accent/60 hover:text-ink hover:shadow-glow focus:outline-none focus-visible:ring-2 focus-visible:ring-accent"
           >
             {text}
           </button>
         ))}
         <Link
           href="/people"
-          className="inline-flex items-center justify-center rounded-full border border-line bg-bg px-4 py-2 text-sm text-ink-2 hover:bg-bg-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+          className="inline-flex items-center justify-center rounded-full border border-line bg-bg-raise px-4 py-2 text-sm text-ink-2 shadow-sm transition-all hover:-translate-y-px hover:border-accent/60 hover:text-ink hover:shadow-glow focus:outline-none focus-visible:ring-2 focus-visible:ring-accent"
         >
           Pair a peer →
         </Link>
@@ -520,7 +480,23 @@ function ChatInner() {
     } catch {
       /* persistence is best-effort */
     }
+    // ThreadsNav reads the picker through localStorage, which has no
+    // same-tab change event: notify it so the sidebar reloads the
+    // newly selected agent's threads.
+    window.dispatchEvent(new Event("nexus-agent-change"));
   }, []);
+
+  // Deep link from the dashboard's "Chat" button (?agent=<id>): select
+  // the named agent once the /agents list has loaded and validated it.
+  const agentParam = searchParams.get("agent") ?? "";
+  const agentParamAppliedRef = useRef(false);
+  useEffect(() => {
+    if (!agentParam || agentParamAppliedRef.current) return;
+    if (agentOptions.includes(agentParam)) {
+      agentParamAppliedRef.current = true;
+      pickAgent(agentParam);
+    }
+  }, [agentParam, agentOptions, pickAgent]);
   const [question, setQuestion] = useState("");
   const [cards, setCards] = useState<ApprovalCard[]>([]);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -528,27 +504,34 @@ function ChatInner() {
   const [deciding, setDeciding] = useState<string | null>(null);
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [streamInput, setStreamInput] = useState("");
-  const [streamText, setStreamText] = useState<string | null>(null);
-  const [toolCards, setToolCards] = useState<StreamToolCard[]>([]);
-  const [citations, setCitations] = useState<string[]>([]);
-  const [streaming, setStreaming] = useState(false);
-  const [streamError, setStreamError] = useState<string | null>(null);
   const [sessionId, setSessionId] = useState(
     () => threadParam || loadOrCreateSessionId()
   );
   const [live, setLive] = useState<"off" | "on" | "down">("off");
+  const [relayDown, setRelayDown] = useState(false);
   const [historyTurns, setHistoryTurns] = useState<ThreadTurn[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [initialLoading, setInitialLoading] = useState(true);
-  const streamAccumRef = useRef<{
-    tokens: string;
-    doneText: string;
-    citations: string[];
-  }>({ tokens: "", doneText: "", citations: [] });
-  const abortRef = useRef<AbortController | null>(null);
   const nearBottomRef = useRef(true);
   const [showLatest, setShowLatest] = useState(false);
+
+  const foldTurns = useCallback((turns: ThreadTurn[]) => {
+    setHistoryTurns((prev) => [...prev, ...turns]);
+  }, []);
+
+  const {
+    streamInput,
+    setStreamInput,
+    streamText,
+    toolCards,
+    citations,
+    streaming,
+    streamError,
+    hasStreamTurn,
+    runStream,
+    stopStream,
+    resetStream,
+  } = useChatStream({ sessionId, agentHandle, nearBottomRef, onTurnsFolded: foldTurns });
 
   useEffect(() => {
     const onScroll = () => {
@@ -563,25 +546,11 @@ function ChatInner() {
     return () => window.removeEventListener("scroll", onScroll);
   }, []);
 
-  // Stick to the bottom while streaming when the user hasn't scrolled up.
-  useEffect(() => {
-    if (streaming && nearBottomRef.current) {
-      window.scrollTo({
-        top: document.documentElement.scrollHeight,
-        behavior: "auto",
-      });
-    }
-  }, [streamText, streaming]);
-
   const jumpToLatest = useCallback(() => {
     window.scrollTo({
       top: document.documentElement.scrollHeight,
       behavior: "smooth",
     });
-  }, []);
-
-  const stopStream = useCallback(() => {
-    abortRef.current?.abort();
   }, []);
 
   // The URL thread (?t=) is the source of truth: switching history in
@@ -590,16 +559,13 @@ function ChatInner() {
   useEffect(() => {
     if (threadParam) {
       setSessionId(threadParam);
-      setStreamText(null);
-      setToolCards([]);
-      setCitations([]);
-      setStreamError(null);
+      resetStream();
     } else {
       const current = loadOrCreateSessionId();
       setSessionId(current);
       window.history.replaceState(null, "", `/chat?t=${encodeURIComponent(current)}`);
     }
-  }, [threadParam]);
+  }, [threadParam, resetStream]);
 
   useEffect(() => {
     let cancelled = false;
@@ -635,30 +601,51 @@ function ChatInner() {
     messages.map((m) => [m.correlation_id, m])
   );
 
+  // Each endpoint resolves independently: one failing call must not
+  // wipe out the sections that loaded fine (the dashboard page already
+  // isolates this way).
   const refresh = useCallback(async () => {
-    try {
-      const [peerData, cardData, msgData, agentData] = await Promise.all([
-        api<{ peers: Peer[] }>("/pairing/peers"),
-        api<{ approvals: ApprovalCard[] }>("/ask/approvals"),
-        api<{ messages: ChatMessage[] }>("/ask/messages"),
-        api<{ agents: { id: string }[] }>("/agents").catch(() => ({
-          agents: [],
-        })),
-      ]);
-      setPeers(peerData.peers);
-      setCards(cardData.approvals);
-      setMessages(msgData.messages);
-      if (!peerId && peerData.peers.length > 0) {
-        setPeerId(peerData.peers[0].agent_id);
+    const [peersRes, cardsRes, msgRes, agentRes] = await Promise.allSettled([
+      api<{ peers: Peer[] }>("/pairing/peers"),
+      api<{ approvals: ApprovalCard[] }>("/ask/approvals"),
+      api<{ messages: ChatMessage[] }>("/ask/messages"),
+      api<{ agents: { id: string }[] }>("/agents"),
+    ]);
+    let failures = 0;
+    if (peersRes.status === "fulfilled") {
+      const list = peersRes.value.peers;
+      setPeers(list);
+      if (list.length > 0) {
+        // Functional update: refresh must not depend on peerId, or the
+        // mount effect and the WebSocket effect below re-run (double
+        // fetch + socket teardown) on every peer change.
+        setPeerId((prev) => prev || list[0].agent_id);
       }
-      const names = agentData.agents.map((a) => a.id);
+    } else {
+      failures += 1;
+    }
+    if (cardsRes.status === "fulfilled") {
+      setCards(cardsRes.value.approvals);
+    } else {
+      failures += 1;
+    }
+    if (msgRes.status === "fulfilled") {
+      setMessages(msgRes.value.messages);
+    } else {
+      failures += 1;
+    }
+    // The agents call was already best-effort before (`.catch` → empty),
+    // so a rejection here is not a user-facing failure.
+    if (agentRes.status === "fulfilled") {
+      const names = agentRes.value.agents.map((a) => a.id);
       if (names.length > 0) {
         setAgentOptions(names.includes("default") ? names : ["default", ...names]);
       }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not load chat.");
     }
-  }, [peerId]);
+    if (failures > 0) {
+      setError("One or more chat sections failed to refresh.");
+    }
+  }, []);
 
   useEffect(() => {
     void refresh().finally(() => setInitialLoading(false));
@@ -667,49 +654,87 @@ function ChatInner() {
   useEffect(() => {
     let closed = false;
     let ws: WebSocket | null = null;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+    let attempts = 0;
+    const MAX_DELAY_MS = 30000;
+
+    const scheduleReconnect = () => {
+      if (closed) return;
+      attempts += 1;
+      const delay = Math.min(1000 * 2 ** Math.min(attempts, 5), MAX_DELAY_MS);
+      retryTimer = setTimeout(connect, delay);
+    };
+
     // Browsers cannot send Authorization on a WS handshake: mint a
     // single-use ticket over authed HTTP first, then connect with it.
-    void (async () => {
-      let ticket = "";
-      try {
-        const data = await api<{ ticket: string }>("/ask/live-ticket", {
-          method: "POST",
-        });
-        ticket = data.ticket;
-      } catch {
-        if (!closed) setLive("down");
-        return;
-      }
+    // Drops reconnect with exponential backoff (1s → 30s cap); the
+    // header chip shows "live unavailable" while down.
+    const connect = () => {
       if (closed) return;
-      try {
-        ws = new WebSocket(
-          `${wsBase()}/ask/live?ticket=${encodeURIComponent(ticket)}`
-        );
-      } catch {
-        if (!closed) setLive("down");
-        return;
-      }
-      ws.onopen = () => {
-        if (!closed) setLive("on");
-      };
-      ws.onmessage = (event) => {
+      void (async () => {
+        let ticket = "";
         try {
-          const msg = JSON.parse(event.data as string) as { type?: string };
-          if (msg.type === "delivery") void refresh();
+          const data = await api<{ ticket: string }>("/ask/live-ticket", {
+            method: "POST",
+          });
+          ticket = data.ticket;
         } catch {
+          if (!closed) setLive("down");
+          scheduleReconnect();
+          return;
         }
-      };
-      const markDown = () => {
-        if (!closed) setLive("down");
-      };
-      ws.onerror = markDown;
-      ws.onclose = markDown;
-    })();
+        if (closed) return;
+        let socket: WebSocket;
+        try {
+          // Ticket travels as the WS subprotocol (Sec-WebSocket-Protocol),
+          // not the query string — query strings land in access logs.
+          socket = new WebSocket(`${wsBase()}/ask/live`, [ticket]);
+        } catch {
+          if (!closed) setLive("down");
+          scheduleReconnect();
+          return;
+        }
+        ws = socket;
+        socket.onopen = () => {
+          if (closed) return;
+          attempts = 0;
+          setLive("on");
+          setRelayDown(false);
+        };
+        socket.onmessage = (event) => {
+          try {
+            const msg = JSON.parse(event.data as string) as { type?: string };
+            if (msg.type === "delivery") void refresh();
+            else if (msg.type === "relay_down") {
+              // Backend lost the relay and closed right after this frame;
+              // flag it until a reconnect succeeds.
+              if (!closed) setRelayDown(true);
+            }
+          } catch {
+            // Malformed frames are ignored; the socket stays up.
+          }
+        };
+        const markDown = () => {
+          // onerror fires just before onclose: only the first counts,
+          // else every drop schedules two reconnects.
+          if (closed || ws !== socket) return;
+          ws = null;
+          setLive("down");
+          scheduleReconnect();
+        };
+        socket.onerror = markDown;
+        socket.onclose = markDown;
+      })();
+    };
+
+    connect();
     return () => {
       closed = true;
+      if (retryTimer) clearTimeout(retryTimer);
       try {
         ws?.close();
       } catch {
+        // best-effort teardown
       }
     };
   }, [refresh]);
@@ -885,129 +910,6 @@ function ChatInner() {
     [messagesById, messagesByCorrelation, retrying, refresh]
   );
 
-  const runStream = useCallback(async () => {
-    const prompt = streamInput.trim();
-    if (prompt.length === 0 || streaming) return;
-    setStreaming(true);
-    setStreamError(null);
-    setStreamText("");
-    setToolCards([]);
-    setCitations([]);
-    streamAccumRef.current = { tokens: "", doneText: "", citations: [] };
-    const controller = new AbortController();
-    abortRef.current = controller;
-    let failed = false;
-    try {
-      const res = await fetch(
-        `${API_BASE}/chat/stream?message=${encodeURIComponent(prompt)}&session_id=${encodeURIComponent(sessionId)}&agent=${encodeURIComponent(agentHandle)}`,
-        {
-          headers: { Accept: "text/event-stream", ...authHeaders() },
-          signal: controller.signal,
-        }
-      );
-      if (!res.ok || !res.body) {
-        const body = (await res.json().catch(() => ({}))) as {
-          detail?: string;
-        };
-        throw new Error(body.detail ?? `stream failed (${res.status})`);
-      }
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buf = "";
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf += decoder.decode(value, { stream: true });
-        let cut: number;
-        while ((cut = buf.indexOf("\n\n")) >= 0) {
-          const frame = buf.slice(0, cut);
-          buf = buf.slice(cut + 2);
-          for (const line of frame.split("\n")) {
-            const trimmed = line.trim();
-            if (!trimmed.startsWith("data:")) continue;
-            const evt = JSON.parse(trimmed.slice(5)) as {
-              type: string;
-              text?: string;
-              tool?: string;
-              result?: string;
-              citations?: string[];
-              message?: string;
-            };
-            if (evt.type === "token" && evt.text) {
-              setStreamText((prev) => (prev ?? "") + (evt.text as string));
-              streamAccumRef.current.tokens += evt.text as string;
-            } else if (evt.type === "tool_pending" && evt.tool) {
-              const tool = evt.tool;
-              setToolCards((prev) => [...prev, { tool, status: "pending" }]);
-            } else if (evt.type === "tool_completed" && evt.tool) {
-              const tool = evt.tool;
-              const result = evt.result;
-              setToolCards((prev) => {
-                const next = [...prev];
-                const open = next.findIndex(
-                  (c) => c.tool === tool && c.status === "pending"
-                );
-                if (open >= 0) {
-                  next[open] = { tool, status: "completed", result };
-                } else {
-                  next.push({ tool, status: "completed", result });
-                }
-                return next;
-              });
-            } else if (evt.type === "done") {
-              if (evt.text) {
-                const text = evt.text;
-                setStreamText((prev) =>
-                  prev && prev.length > 0 ? prev : text
-                );
-                streamAccumRef.current.doneText = text;
-              }
-              streamAccumRef.current.citations = evt.citations ?? [];
-              setCitations(evt.citations ?? []);
-            } else if (evt.type === "error") {
-              throw new Error(evt.message ?? "Stream failed.");
-            }
-          }
-        }
-      }
-    } catch (err) {
-      if (controller.signal.aborted) {
-        // Stopped by the user: keep the partial text, no error banner.
-        failed = false;
-      } else {
-        failed = true;
-        setStreamError(err instanceof Error ? err.message : "Stream failed.");
-      }
-    } finally {
-      if (abortRef.current === controller) abortRef.current = null;
-      setStreaming(false);
-      // Fold the finished turn into local history (the server persisted
-      // the same rows): the thread reads as one conversation and the
-      // stream block clears instead of duplicating.
-      if (!failed) {
-        const accum = streamAccumRef.current;
-        const finalText = accum.doneText || accum.tokens;
-        if (finalText) {
-          const userText = prompt;
-          const assistantCits = accum.citations;
-          setHistoryTurns((prev) => [
-            ...prev,
-            { role: "user", text: userText, citations: [], created_at: "" },
-            {
-              role: "assistant",
-              text: finalText,
-              citations: assistantCits,
-              created_at: "",
-            },
-          ]);
-          setStreamText(null);
-          setToolCards([]);
-          setCitations([]);
-        }
-      }
-    }
-  }, [streamInput, streaming, sessionId, agentHandle]);
-
   const selectedPeer = peers.find((p) => p.agent_id === peerId) ?? null;
   const { groups: commGroups, leftovers: leftoverMessages } = useMemo(
     () => groupCompletedExchanges(messages),
@@ -1024,12 +926,6 @@ function ChatInner() {
   const trailingCards = cards.filter(
     (c) => !seenCorrelations.has(c.correlation_id)
   );
-  const hasStreamTurn =
-    (streamText !== null && streamText !== "") ||
-    toolCards.length > 0 ||
-    citations.length > 0 ||
-    streaming ||
-    streamError !== null;
   const threadEmpty =
     messages.length === 0 &&
     cards.length === 0 &&
@@ -1040,9 +936,9 @@ function ChatInner() {
     !error;
 
   return (
-    <div className="flex min-h-screen bg-bg text-ink">
+    <div className="flex min-h-screen bg-bg-deep text-ink">
       <div className="flex min-w-0 flex-1 flex-col">
-        <header className="sticky top-0 z-20 flex flex-wrap items-center gap-x-4 gap-y-2 border-b border-line bg-bg/95 px-4 py-3 backdrop-blur">
+        <header className="sticky top-0 z-20 flex flex-wrap items-center gap-x-4 gap-y-2 border-b border-line bg-bg-deep/85 px-4 py-3 backdrop-blur-md">
           <h1 className="text-base font-semibold tracking-tight text-ink">
             Chat
           </h1>
@@ -1104,33 +1000,60 @@ function ChatInner() {
             title={`${pendingCount} pending approvals`}
             className={
               pendingCount > 0
-                ? "inline-flex items-center rounded-full bg-amber-100 px-2.5 py-0.5 text-xs font-medium text-amber-800"
+                ? "inline-flex items-center rounded-full bg-warning-bg px-2.5 py-0.5 text-xs font-medium text-warning-text"
                 : "inline-flex items-center rounded-full bg-bg-subtle px-2.5 py-0.5 text-xs text-ink-3"
             }
           >
             {pendingCount} pending
           </span>
           <span
-            aria-label={live === "on" ? "Live relay updates on" : "Live relay updates off"}
+            aria-label={
+              live === "on"
+                ? "Live relay updates on"
+                : live === "down"
+                  ? "Live updates unavailable — retrying automatically"
+                  : "Live relay updates off"
+            }
             title={
               live === "on"
                 ? "Relay deliveries refresh this view live"
-                : "Live updates unavailable — approvals refresh on send/decide"
+                : live === "down"
+                  ? "Live updates unavailable — retrying automatically; approvals refresh on send/decide"
+                  : "Live updates unavailable — approvals refresh on send/decide"
             }
             className={
               live === "on"
-                ? "inline-flex items-center gap-1.5 rounded-full bg-emerald-50 px-2.5 py-0.5 text-xs font-medium text-emerald-700"
-                : "inline-flex items-center gap-1.5 rounded-full bg-bg-subtle px-2.5 py-0.5 text-xs text-ink-3"
+                ? "inline-flex items-center gap-1.5 rounded-full bg-success-bg px-2.5 py-0.5 text-xs font-medium text-success-text"
+                : live === "down"
+                  ? "inline-flex items-center gap-1.5 rounded-full bg-warning-bg px-2.5 py-0.5 text-xs font-medium text-warning-text"
+                  : "inline-flex items-center gap-1.5 rounded-full bg-bg-subtle px-2.5 py-0.5 text-xs text-ink-3"
             }
           >
             <span
               aria-hidden="true"
               className={`h-1.5 w-1.5 rounded-full ${
-                live === "on" ? "bg-emerald-500" : "bg-ink-3"
+                live === "on"
+                  ? "bg-success"
+                  : live === "down"
+                    ? "bg-warning"
+                    : "bg-ink-3"
               }`}
             />
-            {live === "on" ? "live" : "live off"}
+            {live === "on" ? "live" : live === "down" ? "live unavailable" : "live off"}
           </span>
+          {relayDown && (
+            <span
+              role="status"
+              title="The backend lost its relay connection — relayed deliveries are paused. Reconnects automatically."
+              className="inline-flex items-center gap-1.5 rounded-full bg-warning-bg px-2.5 py-0.5 text-xs font-medium text-warning-text"
+            >
+              <span
+                aria-hidden="true"
+                className="h-1.5 w-1.5 rounded-full bg-warning"
+              />
+              relay down
+            </span>
+          )}
         </header>
 
         <main className="flex flex-1 flex-col px-4 py-6 sm:px-6">
@@ -1166,7 +1089,7 @@ function ChatInner() {
                 <p
                   role="status"
                   aria-live="polite"
-                  className="mx-auto max-w-md rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-center text-sm text-emerald-700"
+                  className="mx-auto max-w-md rounded-lg border border-success-border bg-success-bg px-3 py-2 text-center text-sm text-success-text"
                 >
                   {status}
                 </p>
@@ -1185,16 +1108,16 @@ function ChatInner() {
             )}
             {historyTurns.map((turn, i) =>
               turn.role === "user" ? (
-                <li key={`history-${i}`} className="flex justify-end">
-                  <div className="ml-auto max-w-[85%] rounded-2xl rounded-br-md bg-bg-subtle px-4 py-2.5">
-                    <p className="text-sm text-ink">{turn.text}</p>
+                <li key={turnKey(turn, i)} className="flex justify-end">
+                  <div className="animate-message-in ml-auto max-w-[85%] rounded-2xl rounded-br-md bg-gradient-to-br from-accent to-accent-d px-4 py-2.5 text-white shadow-glow">
+                    <p className="text-sm leading-relaxed text-white">{turn.text}</p>
                   </div>
                 </li>
               ) : (
-                <li key={`history-${i}`} className="flex gap-3">
+                <li key={turnKey(turn, i)} className="animate-message-in flex gap-3">
                   <div
                     aria-hidden="true"
-                    className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-accent text-xs font-semibold text-white"
+                    className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-accent to-accent-d text-xs font-bold text-white shadow-glow"
                   >
                     N
                   </div>
@@ -1204,31 +1127,9 @@ function ChatInner() {
                     </article>
                     <div className="flex items-center gap-2">
                       <CopyButton text={turn.text} label="Copy response" />
-                      {formatTime(turn.created_at) && (
-                        <time className="text-xs text-ink-3">
-                          {formatTime(turn.created_at)}
-                        </time>
-                      )}
+                      <RelativeTime iso={turn.created_at} />
                     </div>
-                    {turn.citations.length > 0 && (
-                      <ul
-                        aria-label="Sources"
-                        className="space-y-1 border-t border-line pt-2"
-                      >
-                        {turn.citations.map((url) => (
-                          <li key={url}>
-                            <a
-                              href={url}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="block truncate text-xs text-accent hover:text-accent-d hover:underline"
-                            >
-                              {url}
-                            </a>
-                          </li>
-                        ))}
-                      </ul>
-                    )}
+                    <CitationList urls={turn.citations} />
                   </div>
                 </li>
               )
@@ -1255,13 +1156,15 @@ function ChatInner() {
                 <Fragment key={msg.message_id}>
                   <li
                     className={
-                      isRequest ? "flex justify-end" : "flex gap-3"
+                      isRequest
+                        ? "flex justify-end"
+                        : "animate-message-in flex gap-3"
                     }
                   >
                     {!isRequest && (
                       <div
                         aria-hidden="true"
-                        className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-accent text-xs font-semibold text-white"
+                        className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-accent to-accent-d text-xs font-bold text-white shadow-glow"
                       >
                         N
                       </div>
@@ -1269,7 +1172,7 @@ function ChatInner() {
                     <div
                       className={
                         isRequest
-                          ? "ml-auto max-w-[85%] rounded-2xl rounded-br-md bg-bg-subtle px-4 py-2.5"
+                          ? "animate-message-in ml-auto max-w-[85%] rounded-2xl rounded-br-md bg-gradient-to-br from-accent to-accent-d px-4 py-2.5 text-white shadow-glow"
                           : "min-w-0 flex-1"
                       }
                     >
@@ -1278,7 +1181,7 @@ function ChatInner() {
                       </p>
                       {body ? (
                         isRequest ? (
-                          <p className="text-sm text-ink">{body}</p>
+                          <p className="text-sm leading-relaxed text-white">{body}</p>
                         ) : (
                           <SafeMarkdown text={body} />
                         )
@@ -1300,7 +1203,7 @@ function ChatInner() {
                           onClick={() => void retryDelivery(msg.message_id)}
                           disabled={retrying === msg.message_id}
                           aria-label={`Retry delivery of ${msg.message_id}`}
-                          className="mt-2 inline-flex items-center justify-center rounded-lg border border-amber-200 bg-amber-50 px-3 py-1.5 text-xs font-medium text-amber-800 hover:bg-amber-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/50 disabled:cursor-not-allowed disabled:opacity-50"
+                          className="mt-2 inline-flex items-center justify-center rounded-lg border border-warning-border bg-warning-bg px-3 py-1.5 text-xs font-medium text-warning-text hover:bg-warning-bg focus:outline-none focus-visible:ring-2 focus-visible:ring-warning/50 disabled:cursor-not-allowed disabled:opacity-50"
                         >
                           {retrying === msg.message_id
                             ? "Retrying…"
@@ -1310,10 +1213,10 @@ function ChatInner() {
                     </div>
                   </li>
                   {inlineCards.map((card) => (
-                    <li key={card.approval_id} className="flex justify-start">
+                    <li key={card.approval_id} className="animate-message-in flex justify-start">
                       <div
                         aria-label={`Approval ${card.action} for ${peerDisplayName(peers, card.requester)}`}
-                        className="w-full space-y-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3"
+                        className="w-full space-y-3 rounded-xl border border-warning-border bg-warning-bg px-4 py-3"
                       >
                         <h3 className="text-sm font-semibold text-ink">
                           {card.action} for {peerDisplayName(peers, card.requester)}
@@ -1359,7 +1262,7 @@ function ChatInner() {
                             type="button"
                             onClick={() => decide(card.approval_id, "reject")}
                             disabled={deciding === card.approval_id}
-                            className="inline-flex items-center justify-center rounded-lg border border-red-200 bg-bg px-4 py-2 text-sm font-medium text-red-600 hover:bg-red-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-red-500/50 disabled:cursor-not-allowed disabled:opacity-50"
+                            className="inline-flex items-center justify-center rounded-lg border border-danger-border bg-bg px-4 py-2 text-sm font-medium text-danger-text hover:bg-danger-bg focus:outline-none focus-visible:ring-2 focus-visible:ring-danger/50 disabled:cursor-not-allowed disabled:opacity-50"
                           >
                             {deciding === card.approval_id
                               ? "Working…"
@@ -1374,10 +1277,10 @@ function ChatInner() {
             })}
 
             {trailingCards.map((card) => (
-              <li key={card.approval_id} className="flex justify-start">
+              <li key={card.approval_id} className="animate-message-in flex justify-start">
                 <div
                   aria-label={`Approval ${card.action} for ${peerDisplayName(peers, card.requester)}`}
-                  className="w-full space-y-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3"
+                  className="w-full space-y-3 rounded-xl border border-warning-border bg-warning-bg px-4 py-3"
                 >
                   <h3 className="text-sm font-semibold text-ink">
                     {card.action} for {peerDisplayName(peers, card.requester)}
@@ -1417,7 +1320,7 @@ function ChatInner() {
                       type="button"
                       onClick={() => decide(card.approval_id, "reject")}
                       disabled={deciding === card.approval_id}
-                      className="inline-flex items-center justify-center rounded-lg border border-red-200 bg-bg px-4 py-2 text-sm font-medium text-red-600 hover:bg-red-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-red-500/50 disabled:cursor-not-allowed disabled:opacity-50"
+                      className="inline-flex items-center justify-center rounded-lg border border-danger-border bg-bg px-4 py-2 text-sm font-medium text-danger-text hover:bg-danger-bg focus:outline-none focus-visible:ring-2 focus-visible:ring-danger/50 disabled:cursor-not-allowed disabled:opacity-50"
                     >
                       {deciding === card.approval_id ? "Working…" : "Deny"}
                     </button>
@@ -1426,15 +1329,28 @@ function ChatInner() {
               </li>
             ))}
             {hasStreamTurn && (
-              <li className="flex gap-3">
+              <li className="animate-message-in flex gap-3">
                 <div
                   aria-hidden="true"
-                  className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-accent text-xs font-semibold text-white"
+                  className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-accent to-accent-d text-xs font-bold text-white shadow-glow"
                 >
                   N
                 </div>
                 <div className="min-w-0 flex-1 space-y-2">
-                  {streamError && <ErrorState message={streamError} />}
+                  {streamError && (
+                    <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                      <div className="min-w-0 flex-1">
+                        <ErrorState message={streamError} />
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => void runStream()}
+                        className={secondaryButtonClass}
+                      >
+                        Retry
+                      </button>
+                    </div>
+                  )}
                   {toolCards.length > 0 && (
                     <ul
                       aria-label="Tool activity"
@@ -1446,7 +1362,7 @@ function ChatInner() {
                           aria-busy={card.status === "pending"}
                           className={
                             card.status === "pending"
-                              ? "inline-flex max-w-full items-center gap-2 rounded-full bg-amber-50 px-3 py-1 font-mono text-xs text-amber-700"
+                              ? "inline-flex max-w-full items-center gap-2 rounded-full bg-warning-bg px-3 py-1 font-mono text-xs text-warning-text"
                               : "inline-flex max-w-full items-center gap-2 rounded-full bg-bg-subtle px-3 py-1 font-mono text-xs text-ink-2"
                           }
                         >
@@ -1467,38 +1383,16 @@ function ChatInner() {
                   )}
                   {streaming &&
                     streamText === "" &&
-                    toolCards.length === 0 && (
-                      <p
-                        aria-live="polite"
-                        className="animate-pulse text-sm text-ink-3"
-                      >
-                        Thinking…
-                      </p>
-                    )}
+                    toolCards.length === 0 && <TypingIndicator />}
                   {streamText !== null && streamText !== "" && (
-                    <article aria-live="polite" className="space-y-2">
+                    <article
+                      aria-live="polite"
+                      className={`space-y-2 ${streaming ? "stream-caret" : ""}`}
+                    >
                       <SafeMarkdown text={streamText} />
                     </article>
                   )}
-                  {citations.length > 0 && (
-                    <ul
-                      aria-label="Sources"
-                      className="space-y-1 border-t border-line pt-2"
-                    >
-                      {citations.map((url) => (
-                        <li key={url}>
-                          <a
-                            href={url}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="block truncate text-xs text-accent hover:text-accent-d hover:underline"
-                          >
-                            {url}
-                          </a>
-                        </li>
-                      ))}
-                    </ul>
-                  )}
+                  <CitationList urls={citations} />
                 </div>
               </li>
             )}
@@ -1521,7 +1415,7 @@ function ChatInner() {
                 {toAnswer.map((item) => (
                   <li
                     key={item.correlation_id}
-                    className="space-y-2 rounded-lg border border-line bg-bg p-3"
+                    className="space-y-2 rounded-lg border border-line bg-bg-raise p-3"
                   >
                     <p className="font-mono text-[11px] text-ink-3">
                       to {item.requester} · {item.correlation_id}
@@ -1566,145 +1460,26 @@ function ChatInner() {
           )}
         </main>
 
-        <footer className="sticky bottom-0 z-20 border-t border-line bg-bg px-4 pb-4 pt-3 sm:px-6">
+        <footer className="sticky bottom-0 z-20 border-t border-line bg-bg-deep/90 px-4 pb-4 pt-3 backdrop-blur-md sm:px-6">
           <div className="mx-auto w-full max-w-3xl space-y-3">
-            <section aria-labelledby="stream-heading">
-              <h2 id="stream-heading" className="sr-only">
-                Live search
-              </h2>
-              <form
-                onSubmit={(e) => {
-                  e.preventDefault();
-                  void runStream();
-                }}
-                className="flex items-center gap-2"
-              >
-                <div className="flex-1">
-                  <label htmlFor="stream-box" className="sr-only">
-                    Ask live
-                  </label>
-                  <textarea
-                    id="stream-box"
-                    value={streamInput}
-                    onChange={(e) => setStreamInput(e.target.value)}
-                    placeholder="Ask live… (web answer with sources)"
-                    rows={1}
-                    disabled={streaming || askBusy}
-                    className="w-full resize-none rounded-2xl border border-line bg-bg px-4 py-2.5 text-sm text-ink placeholder:text-ink-3 focus:border-accent focus:outline-none focus:ring-2 focus:ring-accent/20 disabled:cursor-not-allowed disabled:opacity-50"
-                  />
-                </div>
-                <button
-                  type="submit"
-                  disabled={
-                    (!streaming && askBusy) ||
-                    (!streaming && streamInput.trim().length === 0)
-                  }
-                  aria-label={streaming ? "Stop generation" : "Ask live"}
-                  onClick={(e) => {
-                    if (streaming) {
-                      e.preventDefault();
-                      stopStream();
-                    }
-                  }}
-                  className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-accent text-white hover:bg-accent-d focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/50 disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  {streaming ? (
-                    <span
-                      aria-hidden="true"
-                      className="block h-3 w-3 rounded-[2px] bg-white"
-                    />
-                  ) : (
-                    <svg
-                      aria-hidden="true"
-                      width="16"
-                      height="16"
-                      viewBox="0 0 16 16"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="2"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                    >
-                      <line x1="8" y1="14" x2="8" y2="2" />
-                      <polyline points="3 7 8 2 13 7" />
-                    </svg>
-                  )}
-                </button>
-              </form>
-            </section>
+            <StreamPanel
+              streamInput={streamInput}
+              setStreamInput={setStreamInput}
+              streaming={streaming}
+              askBusy={askBusy}
+              runStream={() => void runStream()}
+              stopStream={stopStream}
+            />
 
-            <section
-              aria-labelledby="ask-heading"
-              className="rounded-2xl border border-line bg-bg p-2 shadow-sm focus-within:border-accent focus-within:ring-2 focus-within:ring-accent/20"
-            >
-              <h2 id="ask-heading" className="sr-only">
-                Ask
-              </h2>
-              {peers.length === 0 ? (
-                <p className="px-3 py-2 text-sm text-ink-3">
-                  No paired peers yet. Pair one first.
-                </p>
-              ) : (
-                <div className="flex items-end gap-2">
-                  <div className="flex-1">
-                    <label htmlFor="question-box" className="sr-only">
-                      Message
-                    </label>
-                    <textarea
-                      id="question-box"
-                      value={question}
-                      onChange={(e) => setQuestion(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter" && !e.shiftKey) {
-                          e.preventDefault();
-                          void sendAsk();
-                        }
-                      }}
-                      placeholder="Message… (Enter to send, Shift+Enter for a new line)"
-                      rows={2}
-                      disabled={askBusy || streaming}
-                      className="w-full resize-none bg-transparent px-3 py-2 text-sm text-ink placeholder:text-ink-3 focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
-                    />
-                  </div>
-                  <button
-                    type="button"
-                    onClick={sendAsk}
-                    disabled={
-                      askBusy ||
-                      streaming ||
-                      !peerId ||
-                      question.trim().length === 0
-                    }
-                    aria-label="Send message"
-                    className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-accent text-white hover:bg-accent-d focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/50 disabled:cursor-not-allowed disabled:opacity-50"
-                  >
-                    {askBusy ? (
-                      <span aria-hidden="true" className="text-sm leading-none">
-                        …
-                      </span>
-                    ) : (
-                      <svg
-                        aria-hidden="true"
-                        width="16"
-                        height="16"
-                        viewBox="0 0 16 16"
-                        fill="none"
-                        stroke="currentColor"
-                        strokeWidth="2"
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                      >
-                        <line x1="8" y1="14" x2="8" y2="2" />
-                        <polyline points="3 7 8 2 13 7" />
-                      </svg>
-                    )}
-                    <span className="sr-only">
-                      {askBusy ? "Sending…" : "Send"}
-                    </span>
-                  </button>
-                </div>
-              )}
-            </section>
+            <AskPanel
+              peers={peers}
+              question={question}
+              setQuestion={setQuestion}
+              peerId={peerId}
+              sendAsk={() => void sendAsk()}
+              askBusy={askBusy}
+              streaming={streaming}
+            />
           </div>
         </footer>
         {showLatest && (
@@ -1712,7 +1487,7 @@ function ChatInner() {
             type="button"
             onClick={jumpToLatest}
             aria-label="Jump to latest messages"
-            className="fixed bottom-40 right-4 z-30 inline-flex h-9 w-9 items-center justify-center rounded-full border border-line bg-bg text-ink-2 shadow-md hover:bg-bg-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+            className="animate-fade-in fixed bottom-40 right-4 z-30 inline-flex h-10 w-10 items-center justify-center rounded-full border border-accent/40 bg-bg-raise text-accent-ink shadow-pop transition-all hover:border-accent hover:shadow-glow focus:outline-none focus-visible:ring-2 focus-visible:ring-accent"
           >
             <svg
               aria-hidden="true"

@@ -49,7 +49,7 @@ def test_task_full_run_completed(isolated_db, monkeypatch):
     client = _client(monkeypatch)
     agent = _agent(client)
     _cap(client, agent["id"], "job")
-    client.post("/ask/policy", json={"peer": "*", "action": "*"})
+    client.post("/ask/policy", json={"peer": "owner", "action": "*"})
     resp = client.post(
         "/tasks",
         json={"target_agent": agent["id"],

@@ -5,7 +5,7 @@ import { useCallback, useEffect, useState } from "react";
 import { api } from "../components/api";
 import {
   EmptyState,
-  ErrorAlert,
+  ErrorRetry,
   LoadingSkeleton,
   PageHeader,
   StatusBadge,
@@ -100,7 +100,7 @@ export default function DashboardPage() {
       />
       {error && (
         <div className="mb-4">
-          <ErrorAlert message={error} />
+          <ErrorRetry message={error} onRetry={() => void load()} />
         </div>
       )}
       {loading ? (
@@ -135,9 +135,9 @@ export default function DashboardPage() {
                 <Link
                   key={card.label}
                   href={card.href}
-                  className="rounded-xl border border-line bg-bg-subtle p-4 hover:bg-bg-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                  className="rounded-xl border border-line bg-bg-subtle p-4 shadow-sm transition-all hover:-translate-y-0.5 hover:border-accent/50 hover:shadow-card focus:outline-none focus-visible:ring-2 focus-visible:ring-accent"
                 >
-                  <p className="text-2xl font-semibold text-ink">{card.value}</p>
+                  <p className="bg-gradient-to-br from-ink to-ink-2 bg-clip-text text-2xl font-semibold text-transparent">{card.value}</p>
                   <p className="mt-1 text-xs text-ink-2">{card.label}</p>
                 </Link>
               ))}
@@ -156,7 +156,7 @@ export default function DashboardPage() {
                 {needsAttention.slice(0, 5).map((t) => (
                   <li
                     key={t.task_id}
-                    className="flex items-center justify-between gap-3 rounded-xl border border-red-200 bg-red-50 px-4 py-2.5"
+                    className="flex items-center justify-between gap-3 rounded-xl border border-danger-border bg-danger-bg px-4 py-2.5"
                   >
                     <div className="min-w-0">
                       <p className="truncate text-sm font-medium text-ink">

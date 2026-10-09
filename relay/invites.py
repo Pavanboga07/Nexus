@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from relay.directory import verify_card
 from relay.models import ClaimAttempt, Invite
+from relay.pairing import PairingError, normalize_code
 
 INVITE_TTL_SECONDS = 900
 MAX_ATTEMPTS = 5
@@ -29,8 +30,6 @@ def _utcnow() -> datetime:
 
 
 async def create_invite_entry(session: AsyncSession, card: Any, code: Any, *, ttl_seconds: int = INVITE_TTL_SECONDS) -> datetime:
-    from app.pairing import PairingError, normalize_code
-
     try:
         normalized = normalize_code(code)
     except PairingError as exc:
@@ -45,10 +44,13 @@ async def create_invite_entry(session: AsyncSession, card: Any, code: Any, *, tt
         raise InviteClaimError(status, code_name, str(exc)) from exc
     try:
         ttl = int(ttl_seconds)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         ttl = INVITE_TTL_SECONDS
+    # Clamp: user-controlled TTL must not exceed the 15-minute default and
+    # must never reach timedelta() overflow (m2: 10**18 seconds -> 500).
+    ttl = max(0, min(ttl, INVITE_TTL_SECONDS))
     at = _utcnow()
-    expires_at = at + timedelta(seconds=max(0, ttl))
+    expires_at = at + timedelta(seconds=ttl)
     token_hash = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
     existing = (await session.execute(select(Invite).where(Invite.token_hash == token_hash))).scalar_one_or_none()
     if existing is None:
@@ -71,8 +73,6 @@ async def _recent_ip_attempts(session: AsyncSession, ip: str) -> int:
 
 
 async def claim_invite_entry(session: AsyncSession, code: Any, ip: str) -> dict[str, Any]:
-    from app.pairing import PairingError, normalize_code
-
     if await _recent_ip_attempts(session, ip) >= MAX_ATTEMPTS:
         raise InviteClaimError(429, "COOLDOWN", "too many wrong codes; try again in a few minutes.")
     try:

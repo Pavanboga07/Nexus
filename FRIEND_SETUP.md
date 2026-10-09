@@ -66,10 +66,10 @@ You should see `Uvicorn running` and no Traceback.
 
 1. At the top, in **Model key**, pick **Google Gemini**, paste your
    Gemini key → **Save key**.
-3. The key is checked live before it is saved: a bad key is rejected
+2. The key is checked live before it is saved: a bad key is rejected
    with the provider's message and never stored. When it says
    **Configured**, say hi to your agent.
-4. To change it later, paste a new key in the same box (**Rotate key**) —
+3. To change it later, paste a new key in the same box (**Rotate key**) —
    same check, same box.
 
 Manual live check (proves the saved key works end to end): after
@@ -100,8 +100,19 @@ it and try again.
 The image already points at the shared relay and the Gemini-compatible
 provider. If I ever ask you to aim elsewhere, add `-e` flags to the
 `docker run` command above, e.g. `-e NEXUS_LLM_MODEL="other-model"`.
-Explicit `-e` values always win over the built-ins (and over the key
-saved in the app, for the model key). You never need these for normal use.
+Precedence (the reverse of what you'd guess): a value already saved in
+the app always wins; `-e` flags apply only when nothing was saved in the
+app; built-in defaults apply last. So if I ask for a `-e` flag to take
+effect, clear the matching saved value in the app first, then restart
+with the flag. You never need these for normal use.
+
+One exception: `NEXT_PUBLIC_NEXUS_API` is baked into the browser bundle
+at *build* time, so a runtime `-e NEXT_PUBLIC_NEXUS_API=...` does nothing
+for the already-built image. To aim the UI at a different backend you
+must rebuild with
+`--build-arg NEXT_PUBLIC_NEXUS_API=http://<host>:8001` (same for
+`NEXT_PUBLIC_NEXUS_WS`, the live-updates WebSocket, e.g.
+`wss://<host>`).
 
 ## Rules (short version)
 

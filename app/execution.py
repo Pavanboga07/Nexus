@@ -20,18 +20,17 @@ gate is what delegation and future per-agent loops must use.
 from __future__ import annotations
 
 import json
+import sqlite3
 import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+from app import agents, capabilities, delegations
+from app.errors import NexusError
 
-class ExecutionError(RuntimeError):
+
+class ExecutionError(NexusError):
     """Execution refused/failed with machine ``code`` + HTTP ``status``."""
-
-    def __init__(self, code: str, message: str, status: int | None = None):
-        super().__init__(f"{code}: {message}")
-        self.code = code
-        self.status = status
 
 
 def _is_self(requester: str, acting: dict[str, Any]) -> bool:
@@ -41,7 +40,7 @@ def _is_self(requester: str, acting: dict[str, Any]) -> bool:
 
 
 async def execute_capability(
-    conn,
+    conn: sqlite3.Connection,
     *,
     acting_ref: str,
     capability_id: str,
@@ -52,7 +51,9 @@ async def execute_capability(
     task_id: str = "",
 ) -> dict[str, Any]:
     """Execute one capability for an authorized requester."""
-    from app import agents, capabilities, delegations
+    # WHY lazy: app.a2a.service is the A2A facade with its own lazy cycle
+    # edges; app.agent.tools is outside this pass's scope. Both stay
+    # function-level — their modules own those edges.
     from app.a2a import service as policy_service
     from app.agent.tools import build_tools, execute_tool
 

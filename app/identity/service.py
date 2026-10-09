@@ -20,8 +20,12 @@ import base64
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 
 from app.identity import crypto
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 _SELF_VERIFY_MESSAGE = b"nexus-identity-self-verification"
 
@@ -154,5 +158,43 @@ __all__ = [
     "LocalIdentity",
     "ensure_identity",
     "load_identity",
+    "local_key",
+    "local_pubkey",
     "sign_data",
 ]
+
+
+def local_key(conn: sqlite3.Connection) -> tuple["Ed25519PrivateKey", str]:
+    """Local ``(private key, agent_id)``; raises IdentityCorruptionError when unusable.
+
+    Canonical home for the key-material helpers. Route and service layers must
+    import these from here — never underscore-privates from a route module.
+    """
+    from app.machine_config import (
+        MachineConfigError,
+        get_or_create_identity_secret,
+    )
+
+    try:
+        secret = get_or_create_identity_secret()
+    except MachineConfigError as exc:
+        raise IdentityCorruptionError(str(exc)) from exc
+    try:
+        # ensure: the secret self-generates and the identity initializes
+        # on first need; corruption survives only for corrupt stores.
+        view = ensure_identity(conn, secret)
+    except IdentityCorruptionError:
+        raise
+    row = conn.execute(
+        "SELECT encrypted_private_key FROM identity WHERE id = 1"
+    ).fetchone()
+    if row is None:  # pragma: no cover - ensure_identity guarantees the row
+        raise IdentityCorruptionError("No local identity stored yet.")
+    private_raw = crypto.decrypt_private_key(row["encrypted_private_key"], secret)
+    return crypto.load_private_key(private_raw), view.agent_id
+
+
+def local_pubkey(conn: sqlite3.Connection) -> str:
+    """Local public key (base64); empty string when no identity is stored yet."""
+    row = conn.execute("SELECT public_key FROM identity WHERE id = 1").fetchone()
+    return str(row["public_key"]) if row is not None else ""

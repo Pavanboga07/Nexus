@@ -18,6 +18,9 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from app.errors import NexusError
+from app.events import emit_best_effort
+
 TERMINAL = ("COMPLETED", "FAILED", "CANCELLED", "APPROVAL_EXPIRED")
 
 #: Allowed outgoing edges per state (besides * → FAILED/CANCELLED,
@@ -53,13 +56,8 @@ DEFAULT_TIMEOUT_SECONDS = 300
 MAX_CHILDREN = 50
 
 
-class TaskError(RuntimeError):
+class TaskError(NexusError):
     """Task failure with machine ``code`` + HTTP ``status``."""
-
-    def __init__(self, code: str, message: str, status: int | None = None):
-        super().__init__(f"{code}: {message}")
-        self.code = code
-        self.status = status
 
 
 def _now() -> str:
@@ -621,8 +619,14 @@ def reconcile_tasks(conn: sqlite3.Connection,
 
 
 def _bridge_workflow_step(conn: sqlite3.Connection, task_id: str) -> None:
-    """Sync workflow steps when their backing task settles (lazy import
-    avoids a module cycle: workflows only imports tasks inside calls)."""
+    """Sync workflow steps when their backing task settles.
+
+    WHY the import stays lazy (real cycle, not an accident):
+    ``app.workflows`` imports ``app.tasks`` at module top-level (steps
+    are backed by tasks), so ``app.tasks`` importing ``app.workflows``
+    at top-level would be a hard circular import. The one-directional
+    lazy edge here is the documented dodge.
+    """
     from app import workflows
 
     workflows.on_task_settled(conn, task_id)
@@ -632,21 +636,16 @@ def _emit_task_event(conn: sqlite3.Connection, task: dict[str, Any],
                      event_type: str) -> None:
     """Best-effort domain event for trigger matching. Must never break
     the task path itself (events are observability, not control)."""
-    try:
-        from app import autonomy as autonomy_mod
-
-        autonomy_mod.emit_event(
-            conn, event_type,
-            {"task_id": task["task_id"],
-             "status": task.get("status", ""),
-             "capability_id": task.get("capability_id", ""),
-             "correlation_id": task.get("correlation_id", "")},
-            agent_id=task.get("target_agent_id", ""),
-            depth=int(task.get("depth", 0)),
-            root_task_id=task.get("root_task_id", ""),
-        )
-    except Exception:
-        pass
+    emit_best_effort(
+        conn, event_type,
+        {"task_id": task["task_id"],
+         "status": task.get("status", ""),
+         "capability_id": task.get("capability_id", ""),
+         "correlation_id": task.get("correlation_id", "")},
+        agent_id=task.get("target_agent_id", ""),
+        depth=int(task.get("depth", 0)),
+        root_task_id=task.get("root_task_id", ""),
+    )
 
 
 def require_task_actor(conn: sqlite3.Connection, task_id: str,
@@ -671,7 +670,6 @@ def require_task_actor(conn: sqlite3.Connection, task_id: str,
 
 
 __all__ = [
-    "CANCELLED",
     "DEFAULT_TIMEOUT_SECONDS",
     "MAX_RETRIES",
     "NON_RETRYABLE",

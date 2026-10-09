@@ -135,7 +135,11 @@ def _agent_conn():
     from app.agent.context import db_path
     from app.store import migrate, open_db
 
-    conn = open_db(db_path())
+    path = db_path()
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    conn = open_db(path)
     migrate(conn)
     return conn
 

@@ -16,17 +16,25 @@ import re
 from typing import Any
 from urllib.parse import urlsplit
 
+from app.errors import NexusError
+
 _AGENT_RE = re.compile(r"^nexus:ed25519:[0-9a-f]{32}$")
 _TIMEOUT = 10.0
 
 
-class DirectoryError(RuntimeError):
-    """Directory lookup failure with machine ``code`` + HTTP ``status``."""
+class RemoteDirectoryError(NexusError):
+    """Directory lookup failure with machine ``code`` + HTTP ``status``.
 
-    def __init__(self, code: str, message: str, status: int | None = None):
-        super().__init__(f"{code}: {message}")
-        self.code = code
-        self.status = status
+    Renamed from ``DirectoryError`` (finding A7): ``relay/directory.py``
+    defines its own ``DirectoryError`` with a different base class
+    (``ValueError`` vs this module's old ``RuntimeError``), and the two
+    names collided at call sites that import both.
+    """
+
+
+#: Deprecated alias — use :class:`RemoteDirectoryError`. Kept so existing
+#: ``except remote_directory.DirectoryError`` call sites keep working.
+DirectoryError = RemoteDirectoryError
 
 
 def gateway_http_base() -> str:
@@ -43,12 +51,12 @@ def gateway_http_base() -> str:
     try:
         parts = urlsplit(base)
     except ValueError as exc:
-        raise DirectoryError(
+        raise RemoteDirectoryError(
             "BAD_GATEWAY_URL", f"relay URL is malformed: {exc}",
             status=500,
         ) from exc
     if parts.scheme not in ("http", "https") or not parts.hostname:
-        raise DirectoryError(
+        raise RemoteDirectoryError(
             "BAD_GATEWAY_URL",
             "relay URL must be http(s) (or ws(s)) with a host.",
             status=500,
@@ -59,7 +67,7 @@ def gateway_http_base() -> str:
 def _check_id(agent_id: str) -> str:
     cleaned = (agent_id or "").strip()
     if not _AGENT_RE.fullmatch(cleaned):
-        raise DirectoryError(
+        raise RemoteDirectoryError(
             "BAD_AGENT_ID", f"malformed agent id {cleaned!r}.",
             status=400,
         )
@@ -78,15 +86,15 @@ def fetch_card(agent_id: str, *, base_url: str | None = None) -> dict:
     try:
         resp = httpx.get(f"{base}/directory/{ident}", timeout=_TIMEOUT)
     except Exception as exc:
-        raise DirectoryError(
+        raise RemoteDirectoryError(
             "GATEWAY_UNREACHABLE", f"directory unreachable: {exc}",
             status=502,
         ) from exc
     if resp.status_code == 404:
-        raise DirectoryError(
+        raise RemoteDirectoryError(
             "NOT_FOUND", f"no directory entry for {ident}.", status=404)
     if resp.status_code != 200:
-        raise DirectoryError(
+        raise RemoteDirectoryError(
             "GATEWAY_ERROR",
             f"directory answered HTTP {resp.status_code}.",
             status=502,
@@ -94,19 +102,19 @@ def fetch_card(agent_id: str, *, base_url: str | None = None) -> dict:
     try:
         body = resp.json()
     except ValueError as exc:
-        raise DirectoryError(
+        raise RemoteDirectoryError(
             "BAD_GATEWAY_BODY", f"directory returned non-JSON: {exc}",
             status=502,
         ) from exc
     card = body.get("card") if isinstance(body, dict) else None
     if not isinstance(card, dict):
-        raise DirectoryError(
+        raise RemoteDirectoryError(
             "INVALID_CARD", "directory entry has no card object.",
             status=502)
     try:
         verify_card(card)
     except RelayDirectoryError as exc:
-        raise DirectoryError(
+        raise RemoteDirectoryError(
             "INVALID_CARD", f"directory card rejected: {exc}",
             status=502) from exc
     return card
@@ -134,12 +142,12 @@ def search_directory(limit: int = 20, *,
             timeout=_TIMEOUT,
         )
     except Exception as exc:
-        raise DirectoryError(
+        raise RemoteDirectoryError(
             "GATEWAY_UNREACHABLE", f"directory unreachable: {exc}",
             status=502,
         ) from exc
     if resp.status_code != 200:
-        raise DirectoryError(
+        raise RemoteDirectoryError(
             "GATEWAY_ERROR",
             f"directory answered HTTP {resp.status_code}.",
             status=502,
@@ -147,7 +155,7 @@ def search_directory(limit: int = 20, *,
     try:
         body = resp.json()
     except ValueError as exc:
-        raise DirectoryError(
+        raise RemoteDirectoryError(
             "BAD_GATEWAY_BODY", f"directory returned non-JSON: {exc}",
             status=502,
         ) from exc
@@ -169,5 +177,5 @@ def search_directory(limit: int = 20, *,
     return {"entries": entries, "rejected": rejected}
 
 
-__all__ = ["DirectoryError", "fetch_card", "gateway_http_base",
-           "search_directory"]
+__all__ = ["RemoteDirectoryError", "DirectoryError", "fetch_card",
+           "gateway_http_base", "search_directory"]

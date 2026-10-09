@@ -57,6 +57,151 @@ async def _scheduler_loop() -> None:
                         type(exc).__name__, str(exc)[:200])
 
 
+def envelope_ttl_seconds() -> int:
+    """Envelope TTL in seconds (``NEXUS_ENVELOPE_TTL_SECONDS``, default 300).
+
+    Canonical reader for the TTL setting. NOTE: ``app/a2a/envelope.py``
+    ``new_envelope`` still hardcodes ``utc_iso_in(300)`` — threading this
+    setting into envelope creation (a ``ttl_seconds`` parameter) is a
+    one-line follow-up in ``app/a2a/*``, outside this change's scope.
+    """
+    try:
+        return max(1, int(
+            os.environ.get("NEXUS_ENVELOPE_TTL_SECONDS", "") or 300))
+    except ValueError:
+        return 300
+
+
+async def _relay_listener_loop() -> None:
+    """One persistent relay socket with exponential-backoff reconnect.
+
+    Inbound ``delivery`` frames go through the exact same ingest path
+    as the browser live bridge (``ingest_relay_delivery`` from
+    ``app.api.routes.ask``), so inbound delivery survives with no
+    browser tab open. While ``NEXUS_RELAY_URL`` is unset the loop idles
+    on a 60s recheck. Heartbeats need no client work: the relay pings
+    at the transport level and ``StdWs`` answers pongs itself.
+    """
+    from app.a2a import relay_client
+    from app.agent.context import db_path
+    from app.api.routes.ask import (
+        _local_key,
+        _local_pubkey,
+        _relay_ws_url,
+        ingest_relay_delivery,
+    )
+    from app.identity import crypto
+    from app.store import migrate, open_db
+
+    log = logging.getLogger("nexus.relay-listener")
+    backoff = 1.0
+    while True:
+        base = os.environ.get("NEXUS_RELAY_URL", "").strip()
+        if not base:
+            await asyncio.sleep(60)
+            continue
+        conn = open_db(db_path())
+        migrate(conn)
+        try:
+            try:
+                priv, agent_id = _local_key(conn)
+                pubkey = _local_pubkey(conn)
+            except Exception as exc:
+                log.warning("relay listener: no local identity: %s",
+                            str(exc)[:200])
+            else:
+                sign = lambda data: crypto.sign_bytes(priv, data)  # noqa: E731
+                try:
+                    relay_ws = await relay_client.connect(
+                        _relay_ws_url(base),
+                        agent_id=agent_id,
+                        public_key_b64=pubkey,
+                        sign_fn=sign,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    log.warning(
+                        "relay listener connect failed: %s: %s",
+                        type(exc).__name__, str(exc)[:200])
+                else:
+                    log.info("relay listener connected as %s", agent_id)
+                    backoff = 1.0
+                    try:
+                        while True:
+                            frame = await relay_ws.receive_json()
+                            if not isinstance(frame, dict) or (
+                                frame.get("type") != "delivery"
+                            ):
+                                continue
+                            try:
+                                await ingest_relay_delivery(
+                                    conn, relay_ws, frame, priv, agent_id)
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception as exc:
+                                log.warning(
+                                    "delivery ingest failed: %s: %s",
+                                    type(exc).__name__, str(exc)[:200])
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        log.warning(
+                            "relay listener connection lost: %s: %s",
+                            type(exc).__name__, str(exc)[:200])
+                    finally:
+                        try:
+                            await relay_ws.close()
+                        except Exception:  # noqa: BLE001 - best-effort
+                            pass
+        finally:
+            conn.close()
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, 300)
+
+
+async def _sweep_expired_loop() -> None:
+    """Call ``relay.queue.sweep_expired`` every ~60s (best-effort).
+
+    The relay database is a separate Postgres deployment: when
+    ``RELAY_DATABASE_URL`` is unset (the normal app deployment) this
+    loop is a no-op. A separately deployed relay should own the sweep
+    in its own lifespan; this covers the self-hosted case.
+    """
+    log = logging.getLogger("nexus.sweep")
+    try:
+        from relay import db as relay_db
+        from relay import queue as relay_queue
+    except ImportError as exc:
+        log.warning("relay sweep disabled (relay deps missing): %s", exc)
+        return
+    engine = None
+    try:
+        while True:
+            await asyncio.sleep(60)
+            url = os.environ.get("RELAY_DATABASE_URL", "").strip()
+            if not url:
+                continue
+            try:
+                if engine is None:
+                    engine = relay_db.make_engine(
+                        relay_db.resolve_database_url(url))
+                factory = relay_db.make_session_factory(engine)
+                async with factory() as session:
+                    swept = await relay_queue.sweep_expired(session)
+                    await session.commit()
+                if swept:
+                    log.info("swept %d expired relay envelope(s)", swept)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("relay sweep failed: %s: %s",
+                            type(exc).__name__, str(exc)[:200])
+    finally:
+        if engine is not None:
+            await engine.dispose()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup: reconcile crash leftovers, recover workflows, schedule.
@@ -67,6 +212,22 @@ async def lifespan(app: FastAPI):
     explicit resume. Nothing auto-executes on boot.
     """
     log = logging.getLogger("nexus.startup")
+    try:
+        from app.machine_config import (
+            get_or_create_operator_token,
+            operator_token_path,
+        )
+
+        # The operator token exists before any request: the old
+        # lazy-on-first-bearer creation misled FRIEND_SETUP step 3.
+        # The value is never logged — the path only.
+        _, created = get_or_create_operator_token()
+        log.info("operator token at %s%s",
+                 operator_token_path(),
+                 " (created)" if created else "")
+    except Exception as exc:
+        log.warning("operator token bootstrap failed: %s: %s",
+                    type(exc).__name__, str(exc)[:200])
     try:
         from app import tasks as task_tracker
         from app import workflows
@@ -94,11 +255,15 @@ async def lifespan(app: FastAPI):
     if os.environ.get("NEXUS_SCHEDULER", "on").strip().lower() not in (
             "0", "off", "false", "no"):
         scheduler_task = asyncio.create_task(_scheduler_loop())
+    relay_listener_task = asyncio.create_task(_relay_listener_loop())
+    sweep_task = asyncio.create_task(_sweep_expired_loop())
     try:
         yield
     finally:
         if scheduler_task is not None:
             scheduler_task.cancel()
+        relay_listener_task.cancel()
+        sweep_task.cancel()
 
 
 def _fresh_conn():
@@ -137,6 +302,19 @@ async def request_id_middleware(request: Request, call_next):
     request.state.request_id = request_id
     response = await call_next(request)
     response.headers["X-Request-ID"] = request_id
+    return response
+
+
+@app.middleware("http")
+async def security_headers_middleware(request: Request, call_next):
+    """Baseline security headers on every API response (the API never
+    serves framed HTML, so framing is denied outright)."""
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; frame-ancestors 'none'; object-src 'none'"
+    )
     return response
 
 
@@ -182,15 +360,13 @@ def _cors_origins() -> list[str]:
 
 
 # The local frontend(s) call cross-origin in dev; same-origin production
-# deployments should narrow NEXUS_CORS_ORIGINS accordingly.
-# Localhost regex covers any dev port (3000/3001/3002/3003/…) so the UI
-# never breaks just because the default port was taken. External origins
-# are still rejected.
+# deployments should narrow NEXUS_CORS_ORIGINS accordingly. Explicit
+# origin list only (no localhost regex): auth is header-based Bearer,
+# so no cookies cross the boundary and credentials stay disabled.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins(),
-    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )

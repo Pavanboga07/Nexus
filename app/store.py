@@ -9,6 +9,7 @@ second database such as the relay's Postgres).
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from pathlib import Path
 
@@ -328,8 +329,24 @@ CREATE INDEX IF NOT EXISTS idx_operator_tokens_hash
 ]
 
 
+def db_path() -> str:
+    """Canonical SQLite path: ``NEXUS_DB_PATH`` env, else ``data/nexus.db``.
+
+    The one helper every ``os.environ.get("NEXUS_DB_PATH", "data/nexus.db")``
+    call site should use (finding F8). Identical semantics to the inline
+    copies it replaces.
+    """
+    return os.environ.get("NEXUS_DB_PATH", "data/nexus.db")
+
+
 def open_db(path: str | Path) -> sqlite3.Connection:
     """Open a SQLite file with sane V1 defaults (no migration side effect)."""
+    # Central makedirs guard (finding A3): every route ``get_conn()`` grew
+    # its own copy of this; it lives here now so fresh checkouts never 500
+    # on a missing parent dir (finding F2's class of bug).
+    parent = Path(path).expanduser().parent
+    if str(parent) not in ("", "."):
+        os.makedirs(parent, exist_ok=True)
     # check_same_thread=False: route dependencies are generator-based
     # (``yield conn`` + close in finally), and FastAPI/anyio may run
     # setup, route body, and teardown on DIFFERENT worker threads.
