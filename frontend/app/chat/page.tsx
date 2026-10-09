@@ -26,6 +26,16 @@ function mintSessionId(): string {
   return `chat-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+/** Stable React key for a history turn: content hash + index fallback. */
+function turnKey(turn: ThreadTurn, index: number): string {
+  const s = `${turn.role}|${turn.created_at}|${turn.text}|${turn.citations.join(",")}`;
+  let h = 0;
+  for (let i = 0; i < s.length; i++) {
+    h = (Math.imul(31, h) + s.charCodeAt(i)) | 0;
+  }
+  return `history-${h.toString(36)}-${index}`;
+}
+
 function loadOrCreateSessionId(): string {
   if (typeof localStorage === "undefined") return mintSessionId();
   try {
@@ -470,7 +480,23 @@ function ChatInner() {
     } catch {
       /* persistence is best-effort */
     }
+    // ThreadsNav reads the picker through localStorage, which has no
+    // same-tab change event: notify it so the sidebar reloads the
+    // newly selected agent's threads.
+    window.dispatchEvent(new Event("nexus-agent-change"));
   }, []);
+
+  // Deep link from the dashboard's "Chat" button (?agent=<id>): select
+  // the named agent once the /agents list has loaded and validated it.
+  const agentParam = searchParams.get("agent") ?? "";
+  const agentParamAppliedRef = useRef(false);
+  useEffect(() => {
+    if (!agentParam || agentParamAppliedRef.current) return;
+    if (agentOptions.includes(agentParam)) {
+      agentParamAppliedRef.current = true;
+      pickAgent(agentParam);
+    }
+  }, [agentParam, agentOptions, pickAgent]);
   const [question, setQuestion] = useState("");
   const [cards, setCards] = useState<ApprovalCard[]>([]);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -587,9 +613,13 @@ function ChatInner() {
     ]);
     let failures = 0;
     if (peersRes.status === "fulfilled") {
-      setPeers(peersRes.value.peers);
-      if (!peerId && peersRes.value.peers.length > 0) {
-        setPeerId(peersRes.value.peers[0].agent_id);
+      const list = peersRes.value.peers;
+      setPeers(list);
+      if (list.length > 0) {
+        // Functional update: refresh must not depend on peerId, or the
+        // mount effect and the WebSocket effect below re-run (double
+        // fetch + socket teardown) on every peer change.
+        setPeerId((prev) => prev || list[0].agent_id);
       }
     } else {
       failures += 1;
@@ -615,7 +645,7 @@ function ChatInner() {
     if (failures > 0) {
       setError("One or more chat sections failed to refresh.");
     }
-  }, [peerId]);
+  }, []);
 
   useEffect(() => {
     void refresh().finally(() => setInitialLoading(false));
@@ -1003,9 +1033,9 @@ function ChatInner() {
               aria-hidden="true"
               className={`h-1.5 w-1.5 rounded-full ${
                 live === "on"
-                  ? "bg-success-bg0"
+                  ? "bg-success"
                   : live === "down"
-                    ? "bg-warning-bg0"
+                    ? "bg-warning"
                     : "bg-ink-3"
               }`}
             />
@@ -1019,7 +1049,7 @@ function ChatInner() {
             >
               <span
                 aria-hidden="true"
-                className="h-1.5 w-1.5 rounded-full bg-warning-bg0"
+                className="h-1.5 w-1.5 rounded-full bg-warning"
               />
               relay down
             </span>
@@ -1078,13 +1108,13 @@ function ChatInner() {
             )}
             {historyTurns.map((turn, i) =>
               turn.role === "user" ? (
-                <li key={`history-${i}`} className="flex justify-end">
+                <li key={turnKey(turn, i)} className="flex justify-end">
                   <div className="animate-message-in ml-auto max-w-[85%] rounded-2xl rounded-br-md bg-gradient-to-br from-accent to-accent-d px-4 py-2.5 text-white shadow-glow">
                     <p className="text-sm leading-relaxed text-white">{turn.text}</p>
                   </div>
                 </li>
               ) : (
-                <li key={`history-${i}`} className="animate-message-in flex gap-3">
+                <li key={turnKey(turn, i)} className="animate-message-in flex gap-3">
                   <div
                     aria-hidden="true"
                     className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-accent to-accent-d text-xs font-bold text-white shadow-glow"

@@ -41,7 +41,8 @@ type Workflow = {
   id: string;
   name: string;
   status: string;
-  steps: {
+  // Omitted by GET /workflows (list); present on the single-workflow GET.
+  steps?: {
     step_id: string;
     step_key: string;
     target_agent: string;
@@ -64,6 +65,14 @@ type Schedule = {
   enabled: boolean;
   next_run_at: string;
   last_run_at: string;
+};
+
+/** Past tense for action verbs, so toasts read "cancelled" not "canceld". */
+const PAST_TENSE: Record<string, string> = {
+  pause: "paused",
+  cancel: "cancelled",
+  retry: "retried",
+  advance: "advanced",
 };
 
 export default function TasksPage() {
@@ -172,7 +181,7 @@ export default function TasksPage() {
         );
         setSelectedFlow(updated);
         await loadFlows();
-        notify(`Workflow ${verb}d`, "info");
+        notify(`Workflow ${PAST_TENSE[verb] ?? `${verb}d`}`, "info");
       } catch (err) {
         setError(err instanceof Error ? err.message : `${verb} failed.`);
       } finally {
@@ -291,7 +300,10 @@ export default function TasksPage() {
         );
         await load();
         setSelected(updated);
-        notify(`Task ${verb}d`, verb === "cancel" ? "warning" : "info");
+        notify(
+          `Task ${PAST_TENSE[verb] ?? `${verb}d`}`,
+          verb === "cancel" ? "warning" : "info"
+        );
       } catch (err) {
         setError(err instanceof Error ? err.message : `${verb} failed.`);
       } finally {
@@ -659,7 +671,7 @@ export default function TasksPage() {
                     {flow.name || flow.id}
                   </span>
                   <span className="font-mono text-[11px] text-ink-3">
-                    {flow.steps.length} steps
+                    {flow.steps?.length ?? 0} steps
                   </span>
                 </button>
               </li>
@@ -675,7 +687,7 @@ export default function TasksPage() {
               {pill(selectedFlow.status)}
             </div>
             <ul className="space-y-1">
-              {selectedFlow.steps.map((step) => (
+              {selectedFlow.steps?.map((step) => (
                 <li
                   key={step.step_id}
                   className="flex flex-wrap items-center gap-2 font-mono text-[11px] text-ink-2"

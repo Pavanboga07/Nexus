@@ -27,6 +27,7 @@ Limitation: this middleware only sees HTTP scopes (Starlette's
 
 from __future__ import annotations
 
+import logging
 import os
 import secrets
 import time
@@ -36,6 +37,8 @@ from dataclasses import dataclass, field
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
+
+logger = logging.getLogger(__name__)
 
 OPEN_PATHS = ("/health",)
 
@@ -110,23 +113,6 @@ def _bearer_token(request: Request) -> str:
 
 class OwnerDenied(RuntimeError):
     """Internal: resource belongs to another owner (surfaced as 404)."""
-
-
-def require_owner_agent(conn, agent_ref: str) -> dict:
-    """Resolve an agent the caller owns; unknown-or-foreign → 404.
-
-    Never confirms cross-owner existence: both cases look identical.
-    """
-    from app import agents
-
-    principal = current_principal()
-    try:
-        agent = agents.resolve_agent(conn, agent_ref)
-    except agents.AgentError:
-        raise OwnerDenied()
-    if agent["owner_id"] != principal.owner_id:
-        raise OwnerDenied()
-    return agent
 
 
 def principal_for_request(request: Request) -> AuthenticatedPrincipal | None:
@@ -208,7 +194,7 @@ def client_ip(request: Request) -> str:
         if request.client is not None:
             return request.client.host
     except Exception:  # noqa: BLE001 - best-effort only
-        pass
+        logger.debug("client_ip: request.client unreadable", exc_info=True)
     return "unknown"
 
 
@@ -288,6 +274,5 @@ __all__ = [
     "principal_for_request",
     "redeem_live_ticket",
     "require_operator",
-    "require_owner_agent",
     "require_principal",
 ]
