@@ -33,6 +33,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, field_validator
 
+import nexus_crypto as crypto
+
 PROTOCOL = "nexus-a2a"
 VERSION = "0.3"
 
@@ -222,8 +224,6 @@ class Envelope(BaseModel):
 
 def sign_envelope(private_key, unsigned: dict[str, Any]) -> dict[str, Any]:
     """Validate ``unsigned``, sign its canonical bytes, attach signature."""
-    from app.identity import crypto
-
     env = Envelope.model_validate({**unsigned, "signature": None})
     raw_sig = crypto.sign_bytes(private_key, env.canonical_bytes())
     return {
@@ -236,8 +236,6 @@ def verify_envelope_signature(
     envelope: dict[str, Any], public_key_b64: str
 ) -> bool:
     """Verify an envelope's signature. Never raises; False on any fault."""
-    from app.identity import crypto
-
     try:
         signature_b64 = envelope.get("signature")
         if not signature_b64 or not public_key_b64:

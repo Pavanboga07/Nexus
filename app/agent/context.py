@@ -18,8 +18,7 @@ def utcnow() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
-def db_path() -> str:
-    return os.environ.get("NEXUS_DB_PATH", "data/nexus.db")
+from app.store import db_path  # canonical NEXUS_DB_PATH helper (finding F8)
 
 
 def _conn():

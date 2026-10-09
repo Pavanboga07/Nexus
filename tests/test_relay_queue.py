@@ -2,12 +2,15 @@
 
 Offline persist, reconnect redelivery, ack settles, TTL expiry, DLQ
 after N attempts, UNIQUE(message_id) dedup (no memory sets), per-recipient
-cap with oldest-to-DLQ, and SKIP LOCKED concurrent claims.
+cap rejects with QUEUE_FULL (F10: no silent eviction), and SKIP LOCKED
+concurrent claims.
 """
 
 from __future__ import annotations
 
 import asyncio
+
+import pytest
 
 from tests.relay_db import make_envelope, new_agent, run
 
@@ -175,7 +178,9 @@ def test_dlq_after_n_attempts(relay_engine):
     assert dlq == 1
 
 
-def test_full_queue_moves_oldest_to_dlq(relay_engine):
+def test_full_queue_rejects_with_queue_full(relay_engine):
+    """F10: a full per-recipient queue rejects the new message with
+    QUEUE_FULL instead of silently evicting the oldest row to the DLQ."""
     from relay import queue
     from relay.db import make_session_factory
 
@@ -185,7 +190,7 @@ def test_full_queue_moves_oldest_to_dlq(relay_engine):
 
     async def main():
         async with Session() as s:
-            for i in range(3):
+            for i in range(2):
                 await queue.enqueue(
                     s,
                     envelope=make_envelope(
@@ -197,13 +202,26 @@ def test_full_queue_moves_oldest_to_dlq(relay_engine):
                 )
             await s.commit()
         async with Session() as s:
+            with pytest.raises(queue.QueueFullError) as exc_info:
+                await queue.enqueue(
+                    s,
+                    envelope=make_envelope(
+                        sender=alice, recipient=bob,
+                        message_id="msg_cap002",
+                        expires_at=GOOD_EXP,
+                    ),
+                    max_per_recipient=2,
+                )
+            await s.rollback()
+        async with Session() as s:
             rows = await queue.claim_for_recipient(s, bob, limit=10)
             dlq = await queue.dlq_depth(s, bob)
-            return [r["message_id"] for r in rows], dlq
+            return [r["message_id"] for r in rows], dlq, exc_info.value.code
 
-    ids, dlq = run(main())
-    assert ids == ["msg_cap001", "msg_cap002"]  # oldest evicted
-    assert dlq == 1
+    ids, dlq, code = run(main())
+    assert code == "QUEUE_FULL"
+    assert ids == ["msg_cap000", "msg_cap001"]  # nothing evicted
+    assert dlq == 0
 
 
 def test_concurrent_claims_never_double_deliver(relay_engine):

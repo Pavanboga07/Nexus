@@ -13,9 +13,11 @@ from typing import Any
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
+from app.api.errors import coded_error_response
 from pydantic import BaseModel
 
 from app import pairing
+from app.auth import AuthenticatedPrincipal, require_operator
 from app.pairing import PairingError
 
 router = APIRouter(prefix="/pairing", tags=["pairing"])
@@ -38,26 +40,10 @@ class ApproveIn(BaseModel):
 
 
 def _error(exc: PairingError) -> JSONResponse:
-    return JSONResponse(
-        status_code=exc.status or 400,
-        content={"detail": str(exc), "code": exc.code},
-    )
+    return coded_error_response(exc)
 
 
-def get_conn():
-    """Per-request SQLite connection (migrated, closed after)."""
-    from app.store import migrate, open_db
-
-    path = os.environ.get("NEXUS_DB_PATH", "data/nexus.db")
-    parent = os.path.dirname(path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    conn = open_db(path)
-    migrate(conn)
-    try:
-        yield conn
-    finally:
-        conn.close()
+from app.api.deps import get_conn
 
 
 def _relay_base() -> str:
@@ -202,7 +188,8 @@ def peers_route(conn: sqlite3.Connection = Depends(get_conn)):
 
 
 @router.delete("/peers/{agent_id}")
-def unpair_route(agent_id: str, conn: sqlite3.Connection = Depends(get_conn)):
+def unpair_route(agent_id: str, conn: sqlite3.Connection = Depends(get_conn),
+                 _operator: AuthenticatedPrincipal = Depends(require_operator)):
     # Local-only by design: works with the peer unreachable.
     return {"agent_id": agent_id, "removed": pairing.unpair(conn, agent_id)}
 
@@ -231,7 +218,8 @@ def directory_lookup_route(agent_id: str):
 
 @router.post("/peers/{agent_id}/trust")
 def set_trust_route(agent_id: str, body: TrustIn,
-                    conn: sqlite3.Connection = Depends(get_conn)):
+                    conn: sqlite3.Connection = Depends(get_conn),
+                    _operator: AuthenticatedPrincipal = Depends(require_operator)):
     """Move a peer through TRUSTED → SUSPENDED → REVOKED.
 
     Suspended peers exchange nothing new (history kept); revoked peers
