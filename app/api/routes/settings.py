@@ -12,9 +12,15 @@ save or chat turn). ``GET /settings/llm-status`` reports
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+
+from app.auth import (
+    AuthenticatedPrincipal,
+    client_ip,
+    require_operator,
+)
 
 router = APIRouter(prefix="/settings", tags=["settings"])
 
@@ -118,7 +124,8 @@ def llm_status():
 
 
 @router.post("/llm-key")
-def set_llm_key_route(body: LlmKeyIn):
+def set_llm_key_route(body: LlmKeyIn,
+                      _operator: AuthenticatedPrincipal = Depends(require_operator)):
     from app.machine_config import (
         MachineConfigError,
         set_llm_base_url,
@@ -200,7 +207,9 @@ def _owner_db():
 
 
 @router.get("/owners")
-def list_owners_route():
+def list_owners_route(
+    _operator: AuthenticatedPrincipal = Depends(require_operator),
+):
     from app import owners
     from app.agent.context import db_path
     from app.store import migrate, open_db
@@ -214,7 +223,10 @@ def list_owners_route():
 
 
 @router.post("/owners")
-def create_owner_route(body: OwnerIn):
+def create_owner_route(
+    body: OwnerIn,
+    _operator: AuthenticatedPrincipal = Depends(require_operator),
+):
     from app import owners
     from app.agent.context import db_path
     from app.store import migrate, open_db
@@ -234,7 +246,10 @@ def create_owner_route(body: OwnerIn):
 
 
 @router.post("/owners/{owner_id}/tokens")
-def issue_token_route(owner_id: str):
+def issue_token_route(
+    owner_id: str,
+    _operator: AuthenticatedPrincipal = Depends(require_operator),
+):
     from app import owners
     from app.agent.context import db_path
     from app.store import migrate, open_db
@@ -253,7 +268,10 @@ def issue_token_route(owner_id: str):
 
 
 @router.get("/owners/{owner_id}/tokens")
-def list_tokens_route(owner_id: str):
+def list_tokens_route(
+    owner_id: str,
+    _operator: AuthenticatedPrincipal = Depends(require_operator),
+):
     from app import owners
     from app.agent.context import db_path
     from app.store import migrate, open_db
@@ -272,7 +290,10 @@ def list_tokens_route(owner_id: str):
 
 
 @router.post("/tokens/{token_id}/revoke")
-def revoke_token_route(token_id: str):
+def revoke_token_route(
+    token_id: str,
+    _operator: AuthenticatedPrincipal = Depends(require_operator),
+):
     from app import owners
     from app.agent.context import db_path
     from app.store import migrate, open_db
@@ -291,7 +312,10 @@ def revoke_token_route(token_id: str):
 
 
 @router.post("/operator-token/rotate")
-def rotate_operator_token_route(request: Request):
+def rotate_operator_token_route(
+    request: Request,
+    _operator: AuthenticatedPrincipal = Depends(require_operator),
+):
     """Rotate the file operator token; the response carries the new token
     exactly once. Refuses with 409 while ``NEXUS_OPERATOR_TOKEN`` pins it.
 
@@ -301,12 +325,7 @@ def rotate_operator_token_route(request: Request):
     from app.machine_config import MachineConfigError, rotate_operator_token
     from app.ratelimit import check_rate_limit
 
-    client = "unknown"
-    try:
-        fwd = (request.headers.get("x-forwarded-for", "") or "").split(",")[0].strip()
-        client = fwd or (request.client.host if request.client else "unknown")
-    except Exception:
-        client = "unknown"
+    client = client_ip(request)
     allowed, retry = check_rate_limit(f"rotate:{client}", limit=5, window_seconds=300)
     if not allowed:
         return JSONResponse(

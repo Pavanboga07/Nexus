@@ -7,6 +7,7 @@ import sqlite3
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
+from app.api.errors import coded_error_response
 from pydantic import BaseModel
 
 from app import workflows
@@ -43,10 +44,7 @@ def get_conn():
 
 
 def _error(exc: WorkflowError) -> JSONResponse:
-    return JSONResponse(
-        status_code=exc.status or 400,
-        content={"detail": str(exc), "code": exc.code},
-    )
+    return coded_error_response(exc)
 
 
 def _owned_flow(conn, flow_id: str) -> dict:

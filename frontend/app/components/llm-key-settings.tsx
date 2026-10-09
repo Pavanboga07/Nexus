@@ -268,7 +268,7 @@ export function LlmKeySettings() {
                     aria-pressed={id === model.trim()}
                     className={`inline-flex items-center rounded-full border px-2.5 py-1 font-mono text-xs focus:outline-none focus-visible:ring-2 focus-visible:ring-accent ${
                       id === model.trim()
-                        ? "border-accent bg-emerald-50 text-emerald-700"
+                        ? "border-accent bg-accent-soft text-accent-ink"
                         : "border-line bg-bg text-ink-2 hover:bg-bg-hover"
                     }`}
                   >
@@ -314,7 +314,7 @@ export function LlmStatusLine() {
       <span
         aria-hidden="true"
         className={`h-1.5 w-1.5 rounded-full ${
-          status?.configured ? "bg-emerald-500" : "bg-amber-500"
+          status?.configured ? "bg-success-bg0" : "bg-warning-bg0"
         }`}
       />
       {status

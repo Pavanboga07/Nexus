@@ -5,6 +5,7 @@ import { usePathname } from "next/navigation";
 import { Suspense, useEffect, useState } from "react";
 import OperatorBanner from "./components/operator-banner";
 import ThreadsNav from "./components/threads-nav";
+import { ToastProvider } from "./components/ui";
 import "./globals.css";
 
 const navLink =
@@ -39,7 +40,7 @@ function useActive() {
   const pathname = usePathname();
   return (href: string) =>
     pathname === href || (href !== "/chat" && pathname.startsWith(href))
-      ? "bg-bg-hover text-ink font-medium"
+      ? "bg-accent-soft text-accent-ink font-medium"
       : "";
 }
 
@@ -150,21 +151,29 @@ export default function RootLayout({
 
   return (
     <html lang="en">
-      <body className="min-h-screen bg-bg text-ink antialiased">
+      <body className="min-h-screen bg-bg-deep text-ink antialiased">
         <div className="flex min-h-screen">
           <aside
-            className={`fixed inset-y-0 left-0 z-40 hidden shrink-0 flex-col gap-2 border-r border-line bg-bg-subtle py-4 md:flex ${
+            className={`fixed inset-y-0 left-0 z-40 hidden shrink-0 flex-col gap-2 border-r border-line bg-bg py-4 shadow-card transition-[width] duration-200 md:flex ${
               collapsed ? "w-16" : "w-60"
             }`}
           >
             <div
-              className={`flex items-center gap-2 px-4 pb-2 ${
+              className={`flex items-center gap-2.5 px-4 pb-2 ${
                 collapsed ? "justify-center px-0" : "justify-between"
               }`}
             >
               {!collapsed && (
-                <span className="text-base font-semibold tracking-tight text-ink">
-                  Nexus
+                <span className="flex items-center gap-2.5">
+                  <span
+                    aria-hidden="true"
+                    className="flex h-8 w-8 items-center justify-center rounded-xl bg-gradient-to-br from-accent to-accent-d text-sm font-bold text-white shadow-glow"
+                  >
+                    N
+                  </span>
+                  <span className="text-base font-semibold tracking-tight text-ink">
+                    Nexus
+                  </span>
                 </span>
               )}
               <button
@@ -227,7 +236,7 @@ export default function RootLayout({
               collapsed ? "md:ml-16" : "md:ml-60"
             }`}
           >
-            <header className="flex items-center gap-2 border-b border-line bg-bg px-4 py-2 md:hidden">
+            <header className="sticky top-0 z-30 flex items-center gap-2 border-b border-line bg-bg-deep/90 px-4 py-2 backdrop-blur md:hidden">
               <button
                 type="button"
                 onClick={() => setDrawer(true)}
@@ -251,8 +260,10 @@ export default function RootLayout({
               </button>
               <span className="text-sm font-semibold text-ink">Nexus</span>
             </header>
-            <OperatorBanner />
-            {children}
+            <ToastProvider>
+              <OperatorBanner />
+              {children}
+            </ToastProvider>
           </div>
         </div>
 
@@ -264,14 +275,22 @@ export default function RootLayout({
             aria-label="Navigation"
           >
             <div
-              className="absolute inset-0 bg-black/30"
+              className="animate-fade-in absolute inset-0 bg-black/60"
               onClick={() => setDrawer(false)}
               aria-hidden="true"
             />
-            <div className="absolute inset-y-0 left-0 flex w-72 flex-col gap-2 overflow-y-auto border-r border-line bg-bg-subtle py-4">
+            <div className="animate-drawer-in absolute inset-y-0 left-0 flex w-72 flex-col gap-2 overflow-y-auto border-r border-line bg-bg py-4 shadow-pop">
               <div className="flex items-center justify-between px-4 pb-2">
-                <span className="text-base font-semibold tracking-tight text-ink">
-                  Nexus
+                <span className="flex items-center gap-2.5">
+                  <span
+                    aria-hidden="true"
+                    className="flex h-8 w-8 items-center justify-center rounded-xl bg-gradient-to-br from-accent to-accent-d text-sm font-bold text-white shadow-glow"
+                  >
+                    N
+                  </span>
+                  <span className="text-base font-semibold tracking-tight text-ink">
+                    Nexus
+                  </span>
                 </span>
                 <button
                   type="button"
