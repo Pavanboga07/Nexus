@@ -15,9 +15,15 @@ Owner ("local", single operator per laptop)
  └── Approvals (per-correlation owner decisions, task-bound)
 ```
 
-No `owners` table exists by design: one laptop, one operator. The
-operator token (`NEXUS_OPERATOR_TOKEN` / `data/operator_token`) is the
-human trust domain; Ed25519 is the agent trust domain. Never mixed.
+An `owners` table exists (migration v13, `app/store.py`): owner rows
+back `operator_tokens` (SHA-256 at rest, plaintext only at creation)
+with per-owner scopes, and every data row carries an owner boundary
+(`app/owners.py` is the live registry). In practice one laptop serves
+one operator today — the `local` owner, backstopped by the legacy
+file/env operator token (`NEXUS_OPERATOR_TOKEN` / `data/operator_token`),
+which acts as the implicit `local`-owner full-operator credential.
+The operator token is the human trust domain; Ed25519 is the agent
+trust domain. Never mixed.
 
 ## Agent lifecycle
 
@@ -101,8 +107,9 @@ there.
 
 ## What is NOT multi-agent yet
 
-Remote-issuer revocation propagation, gateway directory client,
-metrics/tracing. See the validation report for the honest list.
+Remote-issuer revocation propagation, gateway directory
+search/enumeration (card fetch-by-ID lookup is live — see Phase 4;
+`search_directory` has no callers), metrics/tracing.
 
 ---
 
@@ -205,7 +212,10 @@ EVERY card through the single canonical path
 (NOT_FOUND/GATEWAY_UNREACHABLE/INVALID_CARD), queries use encoded
 params, agent IDs are pattern-checked before interpolation. Verified
 cards are DISCOVERY metadata only: dispatch still requires a paired
-+ TRUSTED peer. Search returns `{entries, rejected}`.
++ TRUSTED peer. `search_directory` (returns `{entries, rejected}`) has
+no callers — directory search is not wired into the UI; the live path
+is fetch-by-ID via `GET /pairing/directory/lookup`, used by the People
+page.
 
 ## Cross-Nexus tasks
 
