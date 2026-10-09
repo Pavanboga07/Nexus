@@ -2,6 +2,15 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../components/api";
+import {
+  EmptyState,
+  ErrorAlert,
+  LoadingSkeleton,
+  RelativeTime,
+  StatusNote,
+  secondaryButtonClass,
+  useToast,
+} from "../components/ui";
 
 type Task = {
   task_id: string;
@@ -58,6 +67,7 @@ type Schedule = {
 };
 
 export default function TasksPage() {
+  const notify = useToast();
   const [tasks, setTasks] = useState<Task[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -162,6 +172,7 @@ export default function TasksPage() {
         );
         setSelectedFlow(updated);
         await loadFlows();
+        notify(`Workflow ${verb}d`, "info");
       } catch (err) {
         setError(err instanceof Error ? err.message : `${verb} failed.`);
       } finally {
@@ -189,6 +200,7 @@ export default function TasksPage() {
       setSchedName("");
       setSchedCap("");
       await loadSchedules();
+      notify("Schedule created", "success");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Schedule failed.");
     } finally {
@@ -258,6 +270,7 @@ export default function TasksPage() {
       setCapability("");
       setQuestion("");
       setStatus(`Task ${created.status.toLowerCase()}: ${created.task_id}`);
+      notify(`Task ${created.status.toLowerCase()}`, "success");
       await load();
       await open(created.task_id);
     } catch (err) {
@@ -278,6 +291,7 @@ export default function TasksPage() {
         );
         await load();
         setSelected(updated);
+        notify(`Task ${verb}d`, verb === "cancel" ? "warning" : "info");
       } catch (err) {
         setError(err instanceof Error ? err.message : `${verb} failed.`);
       } finally {
@@ -288,18 +302,25 @@ export default function TasksPage() {
   );
 
   const pill = (state: string) => {
+    const key = (state || "").toLowerCase();
     const cls =
-      state === "COMPLETED"
-        ? "bg-emerald-50 text-emerald-700"
-        : state === "FAILED"
-          ? "bg-red-50 text-red-600"
-          : state === "WAITING_APPROVAL"
-            ? "bg-amber-50 text-amber-700"
-            : "bg-bg-hover text-ink-2";
+      key === "completed"
+        ? "bg-success-bg text-success-text border-success-border"
+        : key === "failed"
+          ? "bg-danger-bg text-danger-text border-danger-border"
+          : ["waiting_approval", "paused"].includes(key)
+            ? "bg-warning-bg text-warning-text border-warning-border"
+            : ["running", "dispatched", "resolving", "authorized"].includes(key)
+              ? "bg-info-bg text-info-text border-info-border"
+              : "bg-bg-hover text-ink-2 border-line";
     return (
       <span
-        className={`inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium uppercase tracking-wide ${cls}`}
+        className={`inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] font-medium uppercase tracking-wide ${cls}`}
       >
+        <span
+          aria-hidden="true"
+          className="h-1.5 w-1.5 rounded-full bg-current"
+        />
         {state.replace(/_/g, " ")}
       </span>
     );
@@ -316,22 +337,18 @@ export default function TasksPage() {
         </p>
       </div>
 
-      {status && (
-        <p
-          role="status"
-          aria-live="polite"
-          className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-700"
-        >
-          {status}
-        </p>
-      )}
+      {status && <StatusNote message={status} />}
       {error && (
-        <p
-          role="alert"
-          className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700"
-        >
-          {error}
-        </p>
+        <div className="space-y-2">
+          <ErrorAlert message={error} />
+          <button
+            type="button"
+            onClick={() => void load()}
+            className={secondaryButtonClass}
+          >
+            Retry
+          </button>
+        </div>
       )}
 
       <section
@@ -433,11 +450,12 @@ export default function TasksPage() {
           Recent tasks
         </h2>
         {loading ? (
-          <p aria-live="polite" className="text-sm text-ink-3">
-            Loading…
-          </p>
+          <LoadingSkeleton label="Loading tasks" />
         ) : tasks.length === 0 ? (
-          <p className="text-sm text-ink-3">No tasks yet.</p>
+          <EmptyState
+            title="No tasks yet."
+            hint="Run your first task above — pick an agent and tell it what to do."
+          />
         ) : (
           <ul className="divide-y divide-line">
             {tasks.map((task) => (
@@ -464,7 +482,7 @@ export default function TasksPage() {
       {selected && (
         <section
           aria-labelledby="task-detail-heading"
-          className="space-y-3 rounded-xl border border-line bg-bg-subtle p-5"
+          className="animate-message-in space-y-3 rounded-xl border border-line bg-bg-raise p-5 shadow-card"
         >
           <div className="flex flex-wrap items-center justify-between gap-2">
             <h2
@@ -512,7 +530,7 @@ export default function TasksPage() {
                 <dt className="text-xs font-medium uppercase tracking-wide text-ink-3">
                   Error
                 </dt>
-                <dd className="text-sm text-red-600">
+                <dd className="text-sm text-danger-text">
                   {selected.error_code} — {selected.error_detail}
                 </dd>
               </>
@@ -595,10 +613,18 @@ export default function TasksPage() {
                 {(selected.events ?? []).map((event, i) => (
                   <li
                     key={`${event.event}-${i}`}
-                    className="font-mono text-[11px] text-ink-3"
+                    className="flex items-baseline justify-between gap-2 font-mono text-[11px] text-ink-3"
                   >
-                    {event.event}
-                    {event.detail ? ` — ${event.detail}` : ""}
+                    <span className="min-w-0 truncate">
+                      {event.event}
+                      {event.detail ? ` — ${event.detail}` : ""}
+                    </span>
+                    {event.created_at && (
+                      <RelativeTime
+                        iso={event.created_at}
+                        className="shrink-0 font-mono text-[11px] text-ink-3"
+                      />
+                    )}
                   </li>
                 ))}
               </ul>
@@ -660,7 +686,7 @@ export default function TasksPage() {
                     {step.target_agent} · {step.capability}
                   </span>
                   {step.error && (
-                    <span className="text-red-600">{step.error}</span>
+                    <span className="text-danger-text">{step.error}</span>
                   )}
                 </li>
               ))}
@@ -802,7 +828,14 @@ export default function TasksPage() {
                   </p>
                   <p className="font-mono text-[11px] text-ink-3">
                     {schedule.trigger} · next{" "}
-                    {schedule.next_run_at || "—"}
+                    {schedule.next_run_at ? (
+                      <RelativeTime
+                        iso={schedule.next_run_at}
+                        className="font-mono text-[11px] text-ink-3"
+                      />
+                    ) : (
+                      "—"
+                    )}
                   </p>
                 </div>
                 <button
