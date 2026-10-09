@@ -1,5 +1,23 @@
 # Audit Report: nexus-v1
 
+> **STALENESS WARNING — read this first.** This report audited a
+> **~Oct 2–3, 2026 tree** (it never named its commit; the newest code it
+> saw predates the operator-token auth model). It is **not** a verdict on
+> the current tree. Since the audit, the codebase changed materially:
+> Bearer-token operator auth with a multi-owner token registry
+> (`OperatorAuthMiddleware`, `owners` + `operator_tokens` tables),
+> persistent schedules + event triggers with routes and UI, fully pinned
+> backend deps (`cryptography==46.0.5`), stdlib logging, and a
+> consolidated shared frontend `api()` client. These claims below are
+> therefore **false today**: "Schedules: MISSING", "Auth on local API:
+> MISSING (by design)", "zero application logging", "almost entirely
+> unpinned deps", and the "6/10, not sound as-is" verdict — do not apply
+> them to code this report never saw. Its §8 fix plan was demonstrably
+> executed: `.gitignore` fixed (`data/`, `machine.json`), `cryptography`
+> pinned with a header citing this report, stdlib logging added, the
+> frontend `api()` helper consolidated. Treat the rest as historical
+> context, not current findings.
+
 ## 1. Summary
 - **What it is:** A local-first, two-laptop AI assistant network. Each laptop runs a modular monolith (FastAPI + SQLite backend, Next.js frontend) with streaming LLM chat, vector/FTS memory, and signed peer-to-peer ask/approve/answer messaging relayed through a shared hosted relay (`wss://nexus-gateway-mv63.onrender.com`) with decentralized trust (Ed25519 identities, fingerprint comparison). Assumed goal (from `README.md:1`): the "locked v1 demo" — two laptops pair via invite codes and complete one ask → approve → cited answer loop. Audience: the developer plus one non-technical friend running the Docker image (`FRIEND_SETUP.md`).
 - **Audit mode: DEMO.** Judged on whether the main flows work convincingly. Production concerns (auth, scale) are noted but weighted lightly, except where they threaten the demo or user data.

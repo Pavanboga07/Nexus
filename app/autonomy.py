@@ -25,19 +25,17 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from app import agents, orchestration, tasks, workflows
+from app.errors import NexusError
+
 MAX_TRIGGER_DEPTH = 5
 MAX_SCHEDULE_FANOUT = 10
 AUTONOMY_LEVELS = ("disabled", "approval_required", "limited", "enabled")
 TICK_GRACE_SECONDS = 3600
 
 
-class AutonomyError(RuntimeError):
+class AutonomyError(NexusError):
     """Autonomy failure with machine ``code`` + HTTP ``status``."""
-
-    def __init__(self, code: str, message: str, status: int | None = None):
-        super().__init__(f"{code}: {message}")
-        self.code = code
-        self.status = status
 
 
 def _now() -> str:
@@ -180,7 +178,6 @@ def create_schedule(
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Persist a schedule and compute its first fire time."""
-    from app import agents
 
     handle = (agent_id or "").strip()
     if not handle:
@@ -327,7 +324,6 @@ async def scheduler_tick(conn: sqlite3.Connection, *,
     one-shot schedules fire once (catch-up) instead of storming.
     Returns the created/found task rows.
     """
-    from app import orchestration
 
     moment = now or datetime.now(timezone.utc)
     if moment.tzinfo is None:
@@ -346,7 +342,6 @@ async def scheduler_tick(conn: sqlite3.Connection, *,
             continue
         fire_key = f"sched:{schedule['id']}:{schedule['next_run_at']}"
         _advance_schedule(conn, schedule, moment)
-        from app import tasks as task_tracker
 
         existing = conn.execute(
             "SELECT task_id FROM tasks WHERE owner_id = 'local'"
@@ -354,9 +349,9 @@ async def scheduler_tick(conn: sqlite3.Connection, *,
             (fire_key,),
         ).fetchone()
         if existing is not None:
-            fired.append(task_tracker.get_task(conn, existing["task_id"]))
+            fired.append(tasks.get_task(conn, existing["task_id"]))
             continue
-        task = task_tracker.create_task(
+        task = tasks.create_task(
             conn,
             requesting_agent_id=schedule["agent_id"],
             target_agent=schedule["target_agent"] or schedule["agent_id"],
@@ -376,6 +371,9 @@ async def scheduler_tick(conn: sqlite3.Connection, *,
         if force_approval:
             # Approval-gated autonomy: park owner consent first and
             # stop — the task runs on advance, never straight through.
+            # WHY lazy: app.a2a.service is the A2A facade with its own
+            # lazy cycle edges; hoisting it here is out of scope for
+            # this pass — its module owns those edges.
             from app.a2a import service as policy_service
 
             orchestration.resolve_task(conn, task["task_id"])
@@ -395,8 +393,8 @@ async def scheduler_tick(conn: sqlite3.Connection, *,
                     (card["approval_id"], task["task_id"]),
                 )
             # resolve_task already moved PENDING → RESOLVING above.
-            task_tracker.transition(conn, task["task_id"], "AUTHORIZED")
-            fired.append(task_tracker.transition(
+            tasks.transition(conn, task["task_id"], "AUTHORIZED")
+            fired.append(tasks.transition(
                 conn, task["task_id"], "WAITING_APPROVAL",
                 detail=card["approval_id"]))
             continue
@@ -480,7 +478,6 @@ def create_trigger(
     enabled: bool = True,
 ) -> dict[str, Any]:
     """Register an event trigger: one target (workflow XOR task)."""
-    from app import agents
 
     handle = (agent_id or "").strip()
     try:
@@ -577,7 +574,6 @@ async def process_events(conn: sqlite3.Connection, *,
     work). Duplicate (trigger, event) pairs resolve to the existing
     task via idempotency keys — never duplicated.
     """
-    from app import orchestration, tasks as task_tracker, workflows
 
     fired: list[dict[str, Any]] = []
     events = conn.execute(
@@ -606,7 +602,7 @@ async def process_events(conn: sqlite3.Connection, *,
             ).fetchone()
             if exists is not None:
                 fired.append(
-                    task_tracker.get_task(conn, exists["task_id"]))
+                    tasks.get_task(conn, exists["task_id"]))
                 continue
             allowed, _ = _check_autonomy(
                 conn, trigger["agent_id"], "trigger")
@@ -628,7 +624,7 @@ async def process_events(conn: sqlite3.Connection, *,
                 fired.append({"workflow_id": done["id"],
                               "status": done["status"]})
                 continue
-            task = task_tracker.create_task(
+            task = tasks.create_task(
                 conn,
                 requesting_agent_id=trigger["agent_id"],
                 target_agent=trigger["target_agent"],
