@@ -24,6 +24,7 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.responses import JSONResponse
+from app.api.errors import coded_error_response
 from pydantic import BaseModel
 
 from app.a2a import relay_client, service
@@ -66,10 +67,7 @@ class ResponseIn(BaseModel):
 
 
 def _error(exc: A2AError) -> JSONResponse:
-    return JSONResponse(
-        status_code=exc.status or 400,
-        content={"detail": str(exc), "code": exc.code},
-    )
+    return coded_error_response(exc)
 
 
 def get_conn():
@@ -100,30 +98,18 @@ def _request_conn() -> sqlite3.Connection:
 
 
 def _local_key(conn: sqlite3.Connection):
-    """Local (private key, agent_id); 503 when identity is corrupt."""
-    import base64
+    """Local (private key, agent_id); 503 when identity is corrupt.
 
-    from app.identity import crypto
-    from app.identity.service import IdentityCorruptionError, ensure_identity
-    from app.machine_config import MachineConfigError, get_or_create_identity_secret
+    Thin route-level wrapper around :func:`app.identity.service.local_key`
+    mapping identity errors into the A2A error vocabulary.
+    """
+    from app.identity.service import IdentityCorruptionError
+    from app.identity.service import local_key as _impl
 
     try:
-        secret = get_or_create_identity_secret()
-    except MachineConfigError as exc:
-        raise A2AError("NO_IDENTITY", str(exc), status=503) from exc
-    try:
-        # ensure: the secret self-generates and the identity initializes
-        # on first need; NO_IDENTITY survives only for corrupt stores.
-        view = ensure_identity(conn, secret)
+        return _impl(conn)
     except IdentityCorruptionError as exc:
         raise A2AError("NO_IDENTITY", str(exc), status=503) from exc
-    row = conn.execute(
-        "SELECT encrypted_private_key FROM identity WHERE id = 1"
-    ).fetchone()
-    private_raw = crypto.decrypt_private_key(
-        row["encrypted_private_key"], secret
-    )
-    return crypto.load_private_key(private_raw), view.agent_id
 
 
 # Shared relay delivery lives in app/dispatch.py (orchestrated
@@ -142,10 +128,10 @@ from app.dispatch import (
 
 
 def _local_pubkey(conn: sqlite3.Connection) -> str:
-    row = conn.execute(
-        "SELECT public_key FROM identity WHERE id = 1"
-    ).fetchone()
-    return str(row["public_key"]) if row is not None else ""
+    """Local public key (base64); thin wrapper around the identity service."""
+    from app.identity.service import local_pubkey as _impl
+
+    return _impl(conn)
 
 
 @router.post("")
@@ -212,13 +198,25 @@ async def response_route(body: ResponseIn, background: BackgroundTasks):
 
 @router.post("/incoming")
 def incoming_route(
-    body: IncomingIn, conn: sqlite3.Connection = Depends(get_conn)
+    body: IncomingIn,
+    background: BackgroundTasks,
+    conn: sqlite3.Connection = Depends(get_conn),
 ):
     try:
         priv, agent_id = _local_key(conn)
         outcome = service.receive_envelope(
             conn, body.envelope, signer_priv=priv, local_id=agent_id
         )
+        # Remote-executed task delegations come back with a signed reply
+        # envelope in the outcome — deliver it to the originator in the
+        # background (same path as response_route).
+        reply = outcome.get("reply") if isinstance(outcome, dict) else None
+        if isinstance(reply, dict) and reply.get("message_id"):
+            _queue_delivery(
+                background,
+                reply,
+                os.environ.get("NEXUS_DB_PATH", "data/nexus.db"),
+            )
         return outcome
     except A2AError as exc:
         return _error(exc)
@@ -239,22 +237,19 @@ async def approve_route(approval_id: str, background: BackgroundTasks):
         signed = service.approve_approval(
             conn, approval_id, signer_priv=priv, local_id=agent_id
         )
-        try:
-            from app import autonomy as autonomy_mod
+        from app.events import emit_best_effort
 
-            row = conn.execute(
-                "SELECT correlation_id FROM a2a_approvals"
-                " WHERE approval_id = ?",
-                (approval_id,),
-            ).fetchone()
-            autonomy_mod.emit_event(
-                conn, "approval.approved",
-                {"approval_id": approval_id,
-                 "correlation_id": row["correlation_id"]
-                 if row is not None else ""},
-            )
-        except Exception:
-            pass
+        row = conn.execute(
+            "SELECT correlation_id FROM a2a_approvals"
+            " WHERE approval_id = ?",
+            (approval_id,),
+        ).fetchone()
+        emit_best_effort(
+            conn, "approval.approved",
+            {"approval_id": approval_id,
+             "correlation_id": row["correlation_id"]
+             if row is not None else ""},
+        )
         return {
             "approval_id": approval_id,
             "status": "approved",
@@ -287,15 +282,12 @@ async def reject_route(
             local_id=agent_id,
             reason=(body.reason if body else "declined by approver"),
         )
-        try:
-            from app import autonomy as autonomy_mod
+        from app.events import emit_best_effort
 
-            autonomy_mod.emit_event(
-                conn, "approval.rejected",
-                {"approval_id": approval_id},
-            )
-        except Exception:
-            pass
+        emit_best_effort(
+            conn, "approval.rejected",
+            {"approval_id": approval_id},
+        )
         return {
             "approval_id": approval_id,
             "status": "rejected",
@@ -358,6 +350,25 @@ def policy_list_route(conn: sqlite3.Connection = Depends(get_conn)):
 def policy_create_route(
     body: RuleIn, conn: sqlite3.Connection = Depends(get_conn)
 ):
+    # An all-wildcard ALLOW rule matches everything: refuse the
+    # empty-body footgun instead of minting it.
+    fields = (
+        (body.peer or "").strip(),
+        (body.data_category or "").strip(),
+        (body.purpose or "").strip(),
+        (body.action or "").strip(),
+        (body.agent or "").strip() if body.agent else "",
+    )
+    if all(value in ("", "*") for value in fields):
+        return JSONResponse(
+            status_code=400,
+            content={
+                "detail": "Refusing wildcard rule: set at least one of "
+                "peer, data_category, purpose, action, or agent to a "
+                "non-wildcard value.",
+                "code": "WILDCARD_RULE",
+            },
+        )
     try:
         return service.create_rule(
             conn,
@@ -378,14 +389,63 @@ def policy_delete_route(
     return {"rule_id": rule_id, "removed": service.delete_rule(conn, rule_id)}
 
 
+async def ingest_relay_delivery(
+    conn: sqlite3.Connection,
+    relay_ws: Any,
+    frame: dict[str, Any],
+    priv: Any,
+    agent_id: str,
+) -> dict[str, Any]:
+    """Ingest ONE relay ``delivery`` frame: ``receive_envelope`` → ack.
+
+    Shared verbatim by the browser live bridge and the background
+    relay listener: each delivery is ingested (creating
+    approvals/answers locally) and settled with ``delivery_ack`` on the
+    relay socket. Poison envelopes are still acked (else the relay
+    redelivers forever). Returns the outcome for the caller to fan out.
+    """
+    envelope = frame.get("envelope", {})
+    try:
+        outcome = service.receive_envelope(
+            conn, envelope, signer_priv=priv, local_id=agent_id
+        )
+    except A2AError as exc:
+        outcome = {"outcome": "error", "code": exc.code}
+        logging.getLogger("nexus.ingest").warning(
+            "delivery ingest rejected: %s (relay_id=%s)",
+            exc.code,
+            frame.get("relay_id", ""),
+        )
+    try:
+        await relay_client.ack_delivery(relay_ws, frame.get("relay_id", ""))
+    except Exception:  # noqa: BLE001 - ack is best-effort
+        pass
+    # A remotely-executed task delegation carries its signed reply in the
+    # outcome — deliver it back to the originator without blocking the pump.
+    reply = outcome.get("reply") if isinstance(outcome, dict) else None
+    if isinstance(reply, dict) and reply.get("message_id"):
+        from app.dispatch import deliver_envelope as _deliver_reply
+
+        asyncio.create_task(
+            _deliver_reply(
+                reply["message_id"],
+                reply,
+                os.environ.get("NEXUS_DB_PATH", "data/nexus.db"),
+            )
+        )
+    return {
+        "relay_id": frame.get("relay_id"),
+        "envelope": envelope,
+        "outcome": outcome.get("outcome"),
+    }
+
+
 async def _pump_relay_deliveries(browser: WebSocket, relay_ws: Any) -> None:
     """Forward relay ``delivery`` frames to the browser.
 
-    Each delivery is ingested via ``receive_envelope`` (creating
-    approvals/answers locally), settled with ``delivery_ack`` on the
-    relay socket, then forwarded so the chat UI refreshes. Poison
-    envelopes are still acked (else the relay redelivers forever) and
-    forwarded as errors.
+    Each delivery is ingested via :func:`ingest_relay_delivery`, then
+    the outcome is forwarded so approvals/decide refresh from live
+    traffic.
     """
     from app.store import migrate, open_db
 
@@ -400,33 +460,11 @@ async def _pump_relay_deliveries(browser: WebSocket, relay_ws: Any) -> None:
                 frame.get("type") != "delivery"
             ):
                 continue
-            envelope = frame.get("envelope", {})
+            outcome = await ingest_relay_delivery(
+                conn, relay_ws, frame, priv, agent_id
+            )
             try:
-                outcome = service.receive_envelope(
-                    conn, envelope, signer_priv=priv, local_id=agent_id
-                )
-            except A2AError as exc:
-                outcome = {"outcome": "error", "code": exc.code}
-                logging.getLogger("nexus.ingest").warning(
-                    "delivery ingest rejected: %s (relay_id=%s)",
-                    exc.code,
-                    frame.get("relay_id", ""),
-                )
-            try:
-                await relay_client.ack_delivery(
-                    relay_ws, frame.get("relay_id", "")
-                )
-            except Exception:  # noqa: BLE001 - ack is best-effort
-                pass
-            try:
-                await browser.send_json(
-                    {
-                        "type": "delivery",
-                        "relay_id": frame.get("relay_id"),
-                        "envelope": envelope,
-                        "outcome": outcome.get("outcome"),
-                    }
-                )
+                await browser.send_json({"type": "delivery", **outcome})
             except Exception:  # noqa: BLE001 - browser went away
                 return
     except (asyncio.CancelledError, WebSocketDisconnect):
@@ -444,15 +482,10 @@ def live_ticket_route(request: Request):
 
     MVP rate limit: 30 tickets per minute per client.
     """
-    from app.auth import issue_live_ticket
+    from app.auth import client_ip, issue_live_ticket
     from app.ratelimit import check_rate_limit
 
-    client = "unknown"
-    try:
-        fwd = (request.headers.get("x-forwarded-for", "") or "").split(",")[0].strip()
-        client = fwd or (request.client.host if request.client else "unknown")
-    except Exception:
-        client = "unknown"
+    client = client_ip(request)
     allowed, retry = check_rate_limit(f"live-ticket:{client}", limit=30, window_seconds=60)
     if not allowed:
         return JSONResponse(
@@ -463,14 +496,31 @@ def live_ticket_route(request: Request):
     return {"ticket": issue_live_ticket()}
 
 
+def _live_ticket_from(browser: WebSocket) -> str:
+    """Read the live-bridge ticket off the handshake.
+
+    Prefer the ``Sec-WebSocket-Protocol`` header (browsers can set the
+    subprotocol on ``new WebSocket(url, [ticket])``); fall back to the
+    legacy ``?ticket=`` query param, which still lands in access logs.
+    """
+    offered = browser.headers.get("sec-websocket-protocol", "")
+    first = offered.split(",")[0].strip()
+    if first:
+        return first
+    return browser.query_params.get("ticket", "")
+
+
 @router.websocket("/live")
 async def live_bridge(browser: WebSocket):
     """Chat's live socket: holds ONE relay connection for this browser.
 
     Browsers cannot send Authorization on the handshake, so auth is a
-    single-use ``?ticket=`` minted at ``POST /ask/live-ticket`` (the
-    auth middleware never sees websocket scopes — enforced here with
-    4401). Signed relay handshake with the local key; relay-auth failure
+    single-use ticket minted at ``POST /ask/live-ticket`` (the auth
+    middleware never sees websocket scopes — enforced here with 4401).
+    The ticket travels in the ``Sec-WebSocket-Protocol`` header when
+    the client offers it (keeps the secret out of the URL and the
+    access logs); the legacy ``?ticket=`` query param still works.
+    Signed relay handshake with the local key; relay-auth failure
     closes this socket with 4401 too. Relay ``delivery`` frames are
     ingested, acked, and forwarded so approvals/decide refresh from
     live traffic.
@@ -478,7 +528,7 @@ async def live_bridge(browser: WebSocket):
     await browser.accept()
     from app.auth import redeem_live_ticket
 
-    if not redeem_live_ticket(browser.query_params.get("ticket", "")):
+    if not redeem_live_ticket(_live_ticket_from(browser)):
         await browser.close(code=relay_client.WS_CLOSE_UNAUTHORIZED)
         return
     from app.store import migrate, open_db
@@ -563,4 +613,4 @@ async def live_bridge(browser: WebSocket):
             pass
 
 
-__all__ = ["router"]
+__all__ = ["ingest_relay_delivery", "router"]

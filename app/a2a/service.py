@@ -31,6 +31,13 @@ from relay import envelope as relay_envelope
 REQUEST_TYPES = ("request", "approval_request")
 RESOLUTION_TYPES = ("approve", "reject")
 
+#: Transport TTL (seconds) for delegation envelopes — the request and
+#: its response. A task round-trip outlives the 300s envelope default,
+#: and an offline peer must still receive the delegation when it
+#: reconnects (audit §4 F6: separate the transport TTL from the
+#: envelope TTL instead of letting queued delegations die at 5 min).
+DELEGATION_TTL_SECONDS = 24 * 3600
+
 # Minimal sensitive set (fail-closed DENY). Deliberately small: v1 has
 # no classifier, so only obviously-secret categories deny outright.
 # Everything else without a rule parks for a human (ASK).
@@ -426,6 +433,7 @@ def create_request(
     message_id: str | None = None,
     correlation_id: str | None = None,
     payload_extra: dict[str, Any] | None = None,
+    ttl_seconds: int | None = None,
 ) -> dict[str, Any]:
     """Sign an ask to a paired peer and store it as sent.
 
@@ -433,6 +441,12 @@ def create_request(
     (``capability_id``, ``delegation_id``, ``target_agent``,
     ``reply_to``) inside the signed payload — same v0.3 envelope,
     no protocol break.
+
+    ``ttl_seconds`` overrides the envelope expiry; when None, task
+    delegations (``capability_id``/``delegation_id`` in
+    ``payload_extra``) get the 24h transport TTL
+    (``DELEGATION_TTL_SECONDS``) while plain asks use the envelope
+    default (``NEXUS_ENVELOPE_TTL_SECONDS``, 300s).
     """
     if message_type not in REQUEST_TYPES:
         raise A2AError(
@@ -449,6 +463,11 @@ def create_request(
             "BAD_PAYLOAD", f"payload_extra not JSON-serializable: {exc}",
             status=400,
         ) from exc
+    if ttl_seconds is None and (
+        str(extra.get("capability_id") or "").strip()
+        or str(extra.get("delegation_id") or "").strip()
+    ):
+        ttl_seconds = DELEGATION_TTL_SECONDS
     unsigned = app_envelope.new_envelope(
         sender=sender_id,
         recipient=recipient_id,
@@ -464,6 +483,7 @@ def create_request(
         expires_at=_now_iso(expires_at) if expires_at is not None else None,
         message_id=message_id,
         correlation_id=correlation_id,
+        ttl_seconds=ttl_seconds,
     )
     signed = app_envelope.sign(unsigned, signer_priv)
     _store(conn, signed, "sent", _now_iso(timestamp))
@@ -482,16 +502,21 @@ def send_response(
     expires_at: datetime | str | None = None,
     message_id: str | None = None,
     remote_task_id: str = "",
+    ttl_seconds: int | None = None,
 ) -> dict[str, Any]:
     """Sign an answer to a paired peer (post-approval) and store it.
 
     ``remote_task_id`` optionally names the responder's own task, so
-    the originator can correlate origin_task ↔ remote_task.
+    the originator can correlate origin_task ↔ remote_task. Responses
+    carrying one are delegation round-trips and get the 24h transport
+    TTL (``DELEGATION_TTL_SECONDS``) unless ``ttl_seconds`` overrides.
     """
     _require_known_recipient(conn, recipient_id)
     payload: dict[str, Any] = {"action": "answer", "answer": answer}
     if (remote_task_id or "").strip():
         payload["remote_task_id"] = remote_task_id.strip()
+    if ttl_seconds is None and payload.get("remote_task_id"):
+        ttl_seconds = DELEGATION_TTL_SECONDS
     unsigned = app_envelope.new_envelope(
         sender=sender_id,
         recipient=recipient_id,
@@ -501,12 +526,272 @@ def send_response(
         expires_at=_now_iso(expires_at) if expires_at is not None else None,
         message_id=message_id,
         correlation_id=correlation_id,
+        ttl_seconds=ttl_seconds,
     )
     signed = app_envelope.sign(unsigned, signer_priv)
     _store(conn, signed, "sent", _now_iso(timestamp))
     return signed
 
 # --- inbound ---------------------------------------------------------------
+
+def _task_delegation(payload: dict[str, Any]) -> dict[str, str] | None:
+    """Detect a task-delegation request inside an ALLOWed ask.
+
+    ``orchestration.dispatch_task`` always embeds ``capability_id``
+    (plus ``delegation_id``/``target_agent``/``task_id``) in the signed
+    payload. Plain asks carry no capability and keep the legacy
+    ``allowed`` path. Returns the delegation fields, or None.
+    """
+    capability_id = str(payload.get("capability_id") or "").strip()
+    if not capability_id:
+        return None
+    return {
+        "capability_id": capability_id,
+        "delegation_id": str(payload.get("delegation_id") or "").strip(),
+        "target_agent": str(payload.get("target_agent") or "").strip(),
+        "origin_task_id": str(payload.get("task_id") or "").strip(),
+    }
+
+
+def _run_blocking(coro):
+    """Drive one coroutine from sync code (the receive path is sync).
+
+    No running loop (HTTP routes, tests): ``asyncio.run`` inline. A
+    loop is already running (the ``/ask/live`` pump): run on a private
+    loop in a helper thread so the caller's loop never deadlocks. The
+    sqlite connection is ``check_same_thread=False`` and the caller
+    blocks here, so the connection is never touched concurrently.
+    """
+    import asyncio
+    import concurrent.futures
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, coro).result()
+
+
+def _execute_remote_task(
+    conn: sqlite3.Connection,
+    live,
+    payload: dict[str, Any],
+    delegated: dict[str, str],
+    *,
+    signer_priv,
+    local_id: str,
+    at: str,
+) -> dict[str, Any]:
+    """Run an ALLOWed remote task-delegation through the local runner.
+
+    Mirrors ``orchestration.dispatch_task``'s local branch in reverse:
+    resolve the executing local agent, persist a local task row (so the
+    run is observable here), execute the capability through the
+    execution gate, then answer with a signed ``response`` — or a
+    signed ``error`` the originator maps to ``REMOTE_<code>``. The
+    inbound message row reaches a terminal status either way: the
+    originator never times out on our side.
+
+    The reply is signed by the executing agent (resolved via the
+    machine secret, like the send path) so the originator's
+    correlation checks accept it. Callers deliver ``reply`` with
+    ``app.dispatch.queue_delivery`` — the same contract as the DENY
+    path. Task shapes that cannot run here fail fast with a signed
+    ``NOT_SUPPORTED`` instead of parking.
+    """
+    from app import agents
+    from app import tasks as task_tracker
+    from app.execution import ExecutionError, execute_capability
+
+    capability_id = delegated["capability_id"]
+    delegation_id = delegated["delegation_id"]
+    purpose = str(payload.get("purpose") or "answer")
+    data_category = str(payload.get("data_category", "general"))
+    question = str(payload.get("question", ""))
+
+    def _signed_error(code: str, message: str, *,
+                      priv=None, sender: str | None = None):
+        reply = app_envelope.signed_error(
+            priv if priv is not None else signer_priv,
+            sender=sender or local_id,
+            recipient=live.sender,
+            correlation_id=live.correlation_id,
+            code=code,
+            message=message,
+        )
+        _store(conn, reply, "sent", at)
+        conn.execute(
+            "UPDATE a2a_messages SET status = 'failed' "
+            "WHERE message_id = ?",
+            (live.message_id,),
+        )
+        conn.commit()
+        return {"outcome": "error", "approval": None, "reply": reply}
+
+    # The executor is a LOCAL agent: the addressed recipient first,
+    # then the payload's target_agent (covers sub-agent addressing).
+    # A paired peer can never execute here.
+    acting = None
+    for ref in (live.recipient, delegated["target_agent"]):
+        if not ref:
+            continue
+        try:
+            candidate = agents.resolve_agent(conn, ref)
+        except agents.AgentError:
+            continue
+        if candidate["status"] == "active":
+            acting = candidate
+            break
+    if acting is None:
+        return _signed_error(
+            "NOT_SUPPORTED",
+            "no active local agent can execute this task "
+            f"(recipient {live.recipient!r}).",
+        )
+
+    try:
+        from app.machine_config import get_or_create_identity_secret
+
+        exec_priv, exec_id = agents.resolve_signing_key(
+            conn, get_or_create_identity_secret(), acting["id"]
+        )
+    except agents.AgentError as exc:
+        return _signed_error(
+            "NOT_SUPPORTED",
+            f"executing agent {acting['id']!r} has no usable key: {exc}",
+        )
+
+    # Persist the remote run locally (observability + correlation).
+    task = task_tracker.create_task(
+        conn,
+        owner_id="remote",
+        requesting_agent_id=live.sender,
+        target_agent=acting["agent_id"],
+        capability=capability_id,
+        purpose=purpose,
+        task_input={
+            "question": question,
+            "data_category": data_category,
+            "origin_task_id": delegated["origin_task_id"],
+            "origin_correlation_id": live.correlation_id,
+        },
+        delegation_id=delegation_id,
+        origin="remote",
+        idempotency_key=f"a2a:{live.message_id}",
+    )
+    task_tracker.transition(
+        conn, task["task_id"], "RESOLVING", detail="remote delegation"
+    )
+    task_tracker.transition(
+        conn, task["task_id"], "AUTHORIZED", detail="a2a policy ALLOW"
+    )
+    task_tracker.transition(
+        conn, task["task_id"], "DISPATCHED", detail=live.message_id
+    )
+    task_tracker.transition(conn, task["task_id"], "RUNNING", detail="local")
+
+    # Fail fast on task shapes that cannot run here (mirrors the
+    # execution gate's checks, with the explicit NOT_SUPPORTED code).
+    from app import capabilities
+
+    try:
+        cap = capabilities.get_capability(conn, capability_id)
+    except capabilities.CapabilityError:
+        task_tracker.fail_task(
+            conn, task["task_id"], "NOT_SUPPORTED",
+            f"unknown capability {capability_id!r} on this host.",
+        )
+        return _signed_error(
+            "NOT_SUPPORTED",
+            f"capability {capability_id!r} is not registered here.",
+            priv=exec_priv, sender=exec_id,
+        )
+    if cap["agent_id"] != acting["agent_id"]:
+        task_tracker.fail_task(
+            conn, task["task_id"], "NOT_SUPPORTED",
+            f"capability {capability_id!r} is not owned by "
+            f"{acting['id']!r}.",
+        )
+        return _signed_error(
+            "NOT_SUPPORTED",
+            f"capability {capability_id!r} is not owned by the "
+            f"addressed agent {acting['id']!r}.",
+            priv=exec_priv, sender=exec_id,
+        )
+    if cap["status"] != "active":
+        task_tracker.fail_task(
+            conn, task["task_id"], "NOT_SUPPORTED",
+            f"capability {capability_id!r} is not active.",
+        )
+        return _signed_error(
+            "NOT_SUPPORTED",
+            f"capability {capability_id!r} is not active here.",
+            priv=exec_priv, sender=exec_id,
+        )
+    if not cap.get("tool"):
+        task_tracker.fail_task(
+            conn, task["task_id"], "NOT_SUPPORTED",
+            f"capability {capability_id!r} binds no executable tool.",
+        )
+        return _signed_error(
+            "NOT_SUPPORTED",
+            f"capability {capability_id!r} binds no executable tool "
+            "(descriptive only).",
+            priv=exec_priv, sender=exec_id,
+        )
+
+    args = {"question": question, "data_category": data_category}
+    try:
+        out = _run_blocking(
+            execute_capability(
+                conn,
+                acting_ref=acting["id"],
+                capability_id=capability_id,
+                args=args,
+                requester_ref=live.sender,
+                purpose=purpose,
+                delegation_id=delegation_id or None,
+                task_id=live.correlation_id,
+            )
+        )
+    except ExecutionError as exc:
+        task_tracker.fail_task(conn, task["task_id"], exc.code, str(exc))
+        return _signed_error(
+            exc.code, str(exc)[:500], priv=exec_priv, sender=exec_id
+        )
+    done = task_tracker.complete_task(
+        conn,
+        task["task_id"],
+        {
+            "capability_id": capability_id,
+            "agent_id": exec_id,
+            "correlation_id": live.correlation_id,
+            "result": out.get("result"),
+        },
+    )
+    result = out.get("result")
+    answer = (
+        result
+        if isinstance(result, str)
+        else json.dumps(result, default=str)
+    )
+    reply = send_response(
+        conn,
+        signer_priv=exec_priv,
+        sender_id=exec_id,
+        recipient_id=live.sender,
+        correlation_id=live.correlation_id,
+        answer=answer,
+        remote_task_id=done["task_id"],
+    )
+    conn.execute(
+        "UPDATE a2a_messages SET status = 'executed' WHERE message_id = ?",
+        (live.message_id,),
+    )
+    conn.commit()
+    return {"outcome": "executed", "approval": None, "reply": reply}
+
 
 def receive_envelope(
     conn: sqlite3.Connection,
@@ -519,7 +804,10 @@ def receive_envelope(
     """Verify + enforce + route one incoming envelope.
 
     Returns ``{"outcome", "approval", "reply"}`` where outcome is one of
-    parked / auto_allow / denied / resolved / answered / error.
+    parked / auto_allow / denied / resolved / answered / executed /
+    error. ``executed`` means an ALLOWed task-delegation ran locally and
+    ``reply`` carries the signed ``response`` (or signed ``error``);
+    callers deliver ``reply`` via ``app.dispatch.queue_delivery``.
     Raises :class:`A2AError` for expired, unpaired, replayed, or
     badly-signed envelopes; unknown types return a signed error reply.
     """
@@ -568,13 +856,16 @@ def receive_envelope(
             status=400,
         )
     sender_key = _sender_public_key(conn, live.sender)
-    _store(conn, dict(envelope), "stored", at)
     if not app_envelope.verify(dict(envelope), sender_key):
+        # Verify BEFORE storing: a bad signature must not consume the
+        # message_id replay slot, or a poison envelope burns the PK and
+        # a later legitimate reuse gets REPLAY 409.
         raise A2AError(
             "INVALID_SIGNATURE",
             "envelope signature does not verify against the known key.",
             status=401,
         )
+    _store(conn, dict(envelope), "stored", at)
     from app import pairing as pairing_mod
 
     pairing_mod.touch_peer_seen(conn, live.sender, at)
@@ -593,6 +884,14 @@ def receive_envelope(
             action=str(payload.get("action", "answer")),
         )
         if decision == "ALLOW":
+            delegated = _task_delegation(payload)
+            if delegated is not None:
+                # Task delegation: execute through the local runner and
+                # answer — never the 'allowed' dead-end.
+                return _execute_remote_task(
+                    conn, live, payload, delegated,
+                    signer_priv=signer_priv, local_id=local_id, at=at,
+                )
             conn.execute(
                 "UPDATE a2a_messages SET status = 'allowed' "
                 "WHERE message_id = ?",
