@@ -2,6 +2,16 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../components/api";
+import {
+  EmptyState,
+  ErrorAlert,
+  LoadingSkeleton,
+  RelativeTime,
+  StatusBadge,
+  StatusNote,
+  secondaryButtonClass,
+  useToast,
+} from "../components/ui";
 
 type Trust = {
   agent_id: string;
@@ -27,6 +37,7 @@ type DirectoryCard = {
 };
 
 export default function PeoplePage() {
+  const notify = useToast();
   const [inviteCode, setInviteCode] = useState<string | null>(null);
   const [inviteBusy, setInviteBusy] = useState(false);
   const [claimInput, setClaimInput] = useState("");
@@ -62,6 +73,14 @@ export default function PeoplePage() {
             : state === "SUSPENDED"
               ? "Peer suspended — no new exchanges until resumed."
               : "Peer trust revoked — their grants no longer verify here."
+        );
+        notify(
+          state === "TRUSTED"
+            ? "Peer trust restored"
+            : state === "SUSPENDED"
+              ? "Peer suspended"
+              : "Peer trust revoked",
+          state === "TRUSTED" ? "success" : "warning"
         );
         await reloadPeers();
       } catch (err) {
@@ -121,6 +140,7 @@ export default function PeoplePage() {
       });
       setInviteCode(data.code);
       setStatus("Invite created. Share the six words out of band.");
+      notify("Invite created", "success");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not create invite.");
     } finally {
@@ -159,6 +179,7 @@ export default function PeoplePage() {
       setTrust(null);
       setClaimInput("");
       setStatus("Peer pinned.");
+      notify("Peer pinned", "success");
       const data = await api<{ peers: Peer[] }>("/pairing/peers");
       setPeers(data.peers);
     } catch (err) {
@@ -174,6 +195,7 @@ export default function PeoplePage() {
       });
       setPeers((prev) => prev.filter((p) => p.agent_id !== agentId));
       setStatus("Peer removed locally.");
+      notify("Peer removed", "warning");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unpair failed.");
     }
@@ -191,22 +213,18 @@ export default function PeoplePage() {
         </p>
       </div>
 
-      {status && (
-        <p
-          role="status"
-          aria-live="polite"
-          className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-700"
-        >
-          {status}
-        </p>
-      )}
+      {status && <StatusNote message={status} />}
       {error && (
-        <p
-          role="alert"
-          className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700"
-        >
-          {error}
-        </p>
+        <div className="space-y-2">
+          <ErrorAlert message={error} />
+          <button
+            type="button"
+            onClick={() => void reloadPeers()}
+            className={secondaryButtonClass}
+          >
+            Retry
+          </button>
+        </div>
       )}
 
       <section
@@ -276,8 +294,8 @@ export default function PeoplePage() {
           </button>
         </div>
         {trust && (
-          <div className="space-y-2 rounded-xl border border-amber-200 bg-amber-50 p-4">
-            <h3 className="text-xs font-semibold uppercase tracking-widest text-amber-700">
+          <div className="space-y-2 rounded-xl border border-warning-border bg-warning-bg p-4">
+            <h3 className="text-xs font-semibold uppercase tracking-widest text-warning-text">
               Trust check
             </h3>
             <p className="text-sm text-ink-2">
@@ -312,14 +330,12 @@ export default function PeoplePage() {
           Connected agents
         </h2>
         {peersLoading ? (
-          <p aria-live="polite" className="text-sm text-ink-3">
-            Loading peers…
-          </p>
+          <LoadingSkeleton label="Loading peers" />
         ) : peers.length === 0 ? (
-          <p className="text-sm text-ink-3">
-            No connected agents yet. Generate an invite above — or claim one
-            someone shared with you.
-          </p>
+          <EmptyState
+            title="No connected agents yet."
+            hint="Generate an invite above — or claim one someone shared with you."
+          />
         ) : (
           <ul className="divide-y divide-line">
             {peers.map((peer) => {
@@ -334,24 +350,18 @@ export default function PeoplePage() {
                       <span className="text-sm font-medium text-ink">
                         {peer.display_name}
                       </span>
-                      <span
-                        className={`inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium uppercase tracking-wide ${
-                          trust === "TRUSTED"
-                            ? "bg-emerald-50 text-emerald-700"
-                            : trust === "SUSPENDED"
-                              ? "bg-amber-50 text-amber-700"
-                              : "bg-red-50 text-red-600"
-                        }`}
-                      >
-                        {trust.toLowerCase()}
-                      </span>
+                      <StatusBadge status={trust} />
                     </div>
                     <code className="block max-w-full truncate font-mono text-xs text-ink-3">
                       {peer.fingerprint}
                     </code>
                     {peer.last_seen_at && (
-                      <p className="text-[11px] text-ink-3">
-                        Last seen {peer.last_seen_at}
+                      <p className="flex items-center gap-1 text-[11px] text-ink-3">
+                        Last seen{" "}
+                        <RelativeTime
+                          iso={peer.last_seen_at}
+                          className="text-[11px] text-ink-3"
+                        />
                       </p>
                     )}
                   </div>
@@ -380,7 +390,7 @@ export default function PeoplePage() {
                         type="button"
                         onClick={() => void changeTrust(peer.agent_id, "REVOKED")}
                         disabled={trustBusy === peer.agent_id}
-                        className="inline-flex items-center justify-center rounded-lg border border-red-200 bg-bg px-3 py-1.5 text-sm font-medium text-red-600 hover:bg-red-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-red-500/50 disabled:cursor-not-allowed disabled:opacity-50"
+                        className="inline-flex items-center justify-center rounded-lg border border-danger-border bg-bg px-3 py-1.5 text-sm font-medium text-danger-text hover:bg-danger-bg focus:outline-none focus-visible:ring-2 focus-visible:ring-danger/50 disabled:cursor-not-allowed disabled:opacity-50"
                       >
                         Revoke
                       </button>
@@ -388,7 +398,7 @@ export default function PeoplePage() {
                     <button
                       type="button"
                       onClick={() => unpair(peer.agent_id)}
-                      className="inline-flex items-center justify-center rounded-lg border border-red-200 bg-bg px-3 py-1.5 text-sm font-medium text-red-600 hover:bg-red-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-red-500/50 disabled:cursor-not-allowed disabled:opacity-50"
+                      className="inline-flex items-center justify-center rounded-lg border border-danger-border bg-bg px-3 py-1.5 text-sm font-medium text-danger-text hover:bg-danger-bg focus:outline-none focus-visible:ring-2 focus-visible:ring-danger/50 disabled:cursor-not-allowed disabled:opacity-50"
                     >
                       Unpair
                     </button>
@@ -442,7 +452,7 @@ export default function PeoplePage() {
         {lookupError && (
           <p
             role="alert"
-            className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700"
+            className="rounded-lg border border-danger-border bg-danger-bg px-3 py-2 text-sm text-danger-text"
           >
             {lookupError}
           </p>

@@ -23,18 +23,16 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from app import agents, capabilities, discovery
+from app.errors import NexusError
+
 GRANT_TYPE = "delegation-grant"
 GRANT_PROTOCOL = "nexus-a2a"
 GRANT_VERSION = "0.3"
 
 
-class DelegationError(RuntimeError):
+class DelegationError(NexusError):
     """Delegation failure with machine ``code`` + HTTP ``status``."""
-
-    def __init__(self, code: str, message: str, status: int | None = None):
-        super().__init__(f"{code}: {message}")
-        self.code = code
-        self.status = status
 
 
 def _now() -> str:
@@ -222,7 +220,6 @@ def issue_grant(
     be registered to the recipient when the recipient is local (remote
     capabilities are advertised on their card, not our registry).
     """
-    from app import agents, capabilities
     from app.identity import crypto
 
     if not (purpose or "").strip():
@@ -258,7 +255,6 @@ def issue_grant(
         raise DelegationError(
             "SELF_GRANT", "issuer and recipient must differ.", status=400
         )
-    from app import discovery
 
     is_local = bool(
         conn.execute(

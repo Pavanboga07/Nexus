@@ -18,13 +18,19 @@ Nothing in this module ever returns private key material.
 from __future__ import annotations
 
 import base64
+import logging
 import re
 import sqlite3
 import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+from app import owners as owners_mod
+from app.errors import NexusError
+from app.events import emit_best_effort
 from app.identity import crypto
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_AGENT_ID = "default"
 DEFAULT_OWNER_ID = "local"
@@ -32,13 +38,8 @@ DEFAULT_OWNER_ID = "local"
 _AGENT_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$")
 
 
-class AgentError(RuntimeError):
+class AgentError(NexusError):
     """Agent registry failure with machine ``code`` + HTTP ``status``."""
-
-    def __init__(self, code: str, message: str, status: int | None = None):
-        super().__init__(f"{code}: {message}")
-        self.code = code
-        self.status = status
 
 
 def _now() -> str:
@@ -129,11 +130,16 @@ def ensure_default_agent(
 
     Same keypair, no fork: version 1 mirrors the identity's sealed key.
     Raises NO_IDENTITY when no identity exists yet (pair or ask first).
+
+    ``secret`` is not decoration: the caller must prove it holds the
+    identity secret by trial-decrypting the sealed identity key before
+    anything is written (finding B2 — the parameter used to be thrown
+    away with ``_ = secret``).
     """
     try:
         return get_agent(conn, DEFAULT_AGENT_ID)
     except AgentError:
-        pass
+        logger.debug("no default agent yet; backfilling from identity")
     row = conn.execute(
         "SELECT agent_id, public_key, encrypted_private_key FROM identity"
         " WHERE id = 1"
@@ -144,6 +150,14 @@ def ensure_default_agent(
             "no local identity yet — pair or ask once first.",
             status=503,
         )
+    try:
+        crypto.decrypt_private_key(row["encrypted_private_key"], secret)
+    except Exception as exc:
+        raise AgentError(
+            "BAD_SECRET",
+            "identity secret does not unlock the local identity.",
+            status=403,
+        ) from exc
     public_raw = base64.b64decode(row["public_key"].encode("ascii"))
     now = _now()
     key_id = f"kid_{uuid.uuid4().hex[:12]}"
@@ -168,9 +182,9 @@ def ensure_default_agent(
                 now,
             ),
         )
-    # NOTE: backfill copies the identity's ALREADY-sealed key; `secret`
-    # is accepted for signature symmetry with create/rotate only.
-    _ = secret
+    # NOTE: the backfill copies the identity's ALREADY-sealed key — the
+    # secret itself is never stored or re-applied; it was verified by
+    # trial-decryption above, which is its whole job here.
     return get_agent(conn, DEFAULT_AGENT_ID)
 
 
@@ -195,7 +209,6 @@ def create_agent(
     owner_id: str = "local",
 ) -> dict[str, Any]:
     """Create an agent with a fresh sealed Ed25519 identity (key v1)."""
-    from app import owners as owners_mod
 
     try:
         owner = owners_mod.get_owner(conn, (owner_id or "local").strip())
@@ -367,17 +380,12 @@ def set_agent_status(
             (status, _now(), agent["agent_id"]),
         )
     if previous != status:
-        try:
-            from app import autonomy as autonomy_mod
-
-            autonomy_mod.emit_event(
-                conn,
-                f"agent.{status}",
-                {"agent_id": agent["agent_id"], "previous": previous},
-                agent_id=agent["agent_id"],
-            )
-        except Exception:
-            pass
+        emit_best_effort(
+            conn,
+            f"agent.{status}",
+            {"agent_id": agent["agent_id"], "previous": previous},
+            agent_id=agent["agent_id"],
+        )
     return get_agent(conn, agent["agent_id"])
 
 
@@ -394,7 +402,7 @@ def key_history(conn: sqlite3.Connection, ref: str) -> list[dict[str, Any]]:
 
 def resolve_signing_key(
     conn: sqlite3.Connection, secret: str, ref: str
-):
+) -> tuple[Any, str]:
     """Load the agent's ACTIVE private key (verified) for signing.
 
     Fails closed: unknown/disabled agents and keyless agents raise
